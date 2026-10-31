@@ -46,6 +46,11 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Local runtime state + private config for the headless server manager
+# (scripts\llm-server.ps1)
+.run/
+scripts/llm-server.config.json
+
 # Brainstorm assets (not tracked in source control)
 .superpowers/
 .claude/

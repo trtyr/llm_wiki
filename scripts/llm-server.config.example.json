@@ -1,0 +1,10 @@
+{
+  "BindHost": "127.0.0.1",
+  "BindPort": 19828,
+  "ClipPort": 19827,
+  "ClipServer": "1",
+  "DataDir": "",
+  "ProjectPath": "",
+  "Token": "",
+  "ProtocPath": ""
+}
