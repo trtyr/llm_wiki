@@ -19,6 +19,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "llm-wiki"
 path = "src/main.rs"
 
+# Headless server: same core library as the desktop app, no GUI shell.
+[[bin]]
+name = "llm-server"
+path = "src/bin/llm-server.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -41,14 +46,16 @@ docx-rs = "0.4.20"
 office_oxide = "=0.1.2"
 anydoc = "0.1.6"
 lancedb = "0.27.2"
-# tokio provided by tauri runtime for async commands
+# tokio provided by tauri runtime for async commands; rt-multi-thread and
+# signal back the dedicated server runtime (headless `llm-server`, and the
+# desktop app's HTTP layer).
 arrow-array = "57"
 arrow-schema = "57"
 futures = "0.3"
 # Claude Code CLI subprocess transport: spawn `claude` as a child process,
 # stream stdout line-by-line back to the frontend. tokio::process gives us
 # async io and clean cancellation; `which` locates the binary on PATH.
-tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "time"] }
+tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "rt-multi-thread", "signal", "time"] }
 which = "7"
 uuid = { version = "1", features = ["v4"] }
 # Multimodal image extraction (Phase 1):

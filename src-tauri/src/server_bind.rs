@@ -1,16 +1,33 @@
 use std::fs;
+use std::path::Path;
 
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
 
 const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 const PUBLIC_BIND_HOST: &str = "0.0.0.0";
 const BIND_HOST_ENV: &str = "LLM_WIKI_BIND_HOST";
+const API_PORT_ENV: &str = "LLM_WIKI_BIND_PORT";
+const CLIP_PORT_ENV: &str = "LLM_WIKI_CLIP_PORT";
+pub const DEFAULT_API_PORT: u16 = 19828;
+pub const DEFAULT_CLIP_PORT: u16 = 19827;
 
-pub fn configured_bind_host(app: &AppHandle) -> String {
+/// Resolve the host the HTTP servers should bind to:
+/// `LLM_WIKI_BIND_HOST` env wins, then the `allowLanAccess` flag in
+/// `app-state.json` (when the host process has one), then loopback.
+pub fn configured_bind_host(store_path: Option<&Path>) -> String {
     configured_env_bind_host()
-        .or_else(|| configured_store_bind_host(app))
+        .or_else(|| configured_store_bind_host(store_path))
         .unwrap_or_else(|| DEFAULT_BIND_HOST.to_string())
+}
+
+/// API server port: `LLM_WIKI_BIND_PORT` env override, then 19828.
+pub fn configured_api_port() -> u16 {
+    configured_env_port(API_PORT_ENV).unwrap_or(DEFAULT_API_PORT)
+}
+
+/// Clip server port: `LLM_WIKI_CLIP_PORT` env override, then 19827.
+pub fn configured_clip_port() -> u16 {
+    configured_env_port(CLIP_PORT_ENV).unwrap_or(DEFAULT_CLIP_PORT)
 }
 
 fn configured_env_bind_host() -> Option<String> {
@@ -19,14 +36,37 @@ fn configured_env_bind_host() -> Option<String> {
         .and_then(|value| sanitize_bind_host(&value))
 }
 
-fn configured_store_bind_host(app: &AppHandle) -> Option<String> {
-    let path = app.path().app_data_dir().ok()?.join("app-state.json");
+fn configured_store_bind_host(store_path: Option<&Path>) -> Option<String> {
+    let path = store_path?;
     let raw = fs::read_to_string(path).ok()?;
     let parsed: Value = serde_json::from_str(&raw).ok()?;
     if allow_lan_access_from_state(&parsed) {
         Some(PUBLIC_BIND_HOST.to_string())
     } else {
         None
+    }
+}
+
+fn configured_env_port(env_key: &str) -> Option<u16> {
+    let raw = std::env::var(env_key).ok()?;
+    parse_port_value(env_key, &raw)
+}
+
+/// Port 0 would silently pick a random port; that's never what a server
+/// operator wants from a config value, so reject it loudly.
+fn parse_port_value(env_key: &str, raw: &str) -> Option<u16> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.parse::<u16>() {
+        Ok(port @ 1..=65535) => Some(port),
+        _ => {
+            eprintln!(
+                "[server-bind] ignoring invalid {env_key} value {raw:?} (expected 1-65535)"
+            );
+            None
+        }
     }
 }
 
@@ -65,7 +105,9 @@ fn allow_lan_access_from_state(value: &Value) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::{allow_lan_access_from_state, bind_addr, sanitize_bind_host};
+    use super::{
+        allow_lan_access_from_state, bind_addr, parse_port_value, sanitize_bind_host,
+    };
 
     #[test]
     fn sanitize_bind_host_accepts_common_lan_hosts() {
@@ -102,5 +144,18 @@ mod tests {
             "apiConfig": { "allowLanAccess": false }
         })));
         assert!(!allow_lan_access_from_state(&json!({})));
+    }
+
+    #[test]
+    fn port_values_accept_valid_and_reject_degenerate_input() {
+        assert_eq!(parse_port_value("LLM_WIKI_BIND_PORT", " 9000 "), Some(9000));
+        assert_eq!(parse_port_value("LLM_WIKI_BIND_PORT", "1"), Some(1));
+        assert_eq!(parse_port_value("LLM_WIKI_BIND_PORT", "65535"), Some(65535));
+        assert_eq!(parse_port_value("LLM_WIKI_BIND_PORT", "0"), None);
+        assert_eq!(parse_port_value("LLM_WIKI_BIND_PORT", "65536"), None);
+        assert_eq!(parse_port_value("LLM_WIKI_BIND_PORT", ""), None);
+        assert_eq!(parse_port_value("LLM_WIKI_BIND_PORT", "  "), None);
+        assert_eq!(parse_port_value("LLM_WIKI_BIND_PORT", "80abc"), None);
+        assert_eq!(parse_port_value("LLM_WIKI_BIND_PORT", "-1"), None);
     }
 }

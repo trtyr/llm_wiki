@@ -3,16 +3,18 @@ mod api_server;
 mod clip_server;
 mod commands;
 mod cors;
+pub mod headless;
 mod panic_guard;
 mod proxy;
 mod server_bind;
+mod server_host;
 mod tray;
 mod types;
 
 use panic_guard::run_guarded;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
@@ -92,7 +94,7 @@ async fn agent_start_turn(
     if let Some(session_id) = request.session_id.clone() {
         if request.history.is_empty() && !request.history_explicit {
             request.history = app
-                .state::<agent::session::AgentSessionStore>()
+                .state::<Arc<agent::session::AgentSessionStore>>()
                 .recent_messages(&project.path, &session_id, 12)
                 .into_iter()
                 .map(|message| agent::types::AgentConversationMessage {
@@ -115,16 +117,16 @@ async fn agent_start_turn(
     let user_message = request.message.clone();
     let persist_session = request.persist_session;
     let cancellation = app
-        .state::<agent::cancel::AgentCancellationRegistry>()
+        .state::<Arc<agent::cancel::AgentCancellationRegistry>>()
         .start(&project.id, &active_session_id, &active_run_id);
     let result = runtime
         .run_once_with_cancel(request, Some(cancellation))
         .await;
-    app.state::<agent::cancel::AgentCancellationRegistry>()
+    app.state::<Arc<agent::cancel::AgentCancellationRegistry>>()
         .finish(&project.id, &active_session_id, &active_run_id);
     let response = result?;
     if persist_session {
-        app.state::<agent::session::AgentSessionStore>()
+        app.state::<Arc<agent::session::AgentSessionStore>>()
             .append_turn(
                 &project.path,
                 &project.id,
@@ -145,7 +147,7 @@ fn agent_cancel_turn(
 ) -> Result<bool, String> {
     let project = resolve_agent_project(&app, &project_id)?;
     Ok(app
-        .state::<agent::cancel::AgentCancellationRegistry>()
+        .state::<Arc<agent::cancel::AgentCancellationRegistry>>()
         .cancel(&project.id, &session_id, run_id.as_deref()))
 }
 
@@ -179,7 +181,7 @@ async fn agent_start_turn_stream(
     let active_run_id = request.run_id.clone().unwrap_or_default();
     if request.history.is_empty() && !request.history_explicit {
         request.history = app
-            .state::<agent::session::AgentSessionStore>()
+            .state::<Arc<agent::session::AgentSessionStore>>()
             .recent_messages(&project.path, &active_session_id, 12)
             .into_iter()
             .map(|message| agent::types::AgentConversationMessage {
@@ -205,7 +207,7 @@ async fn agent_start_turn_stream(
     let user_message = request.message.clone();
     let persist_session = request.persist_session;
     let cancellation = app
-        .state::<agent::cancel::AgentCancellationRegistry>()
+        .state::<Arc<agent::cancel::AgentCancellationRegistry>>()
         .start(&project.id, &active_session_id, &active_run_id);
     tauri::async_runtime::spawn(async move {
         let emit_app = app_for_task.clone();
@@ -225,13 +227,13 @@ async fn agent_start_turn_stream(
             .run_once_with_cancel_and_events(request, Some(cancellation), Some(sink))
             .await;
         app_for_task
-            .state::<agent::cancel::AgentCancellationRegistry>()
+            .state::<Arc<agent::cancel::AgentCancellationRegistry>>()
             .finish(&project_for_task.id, &session_for_task, &run_for_task);
         match result {
             Ok(response) => {
                 if persist_session {
                     app_for_task
-                        .state::<agent::session::AgentSessionStore>()
+                        .state::<Arc<agent::session::AgentSessionStore>>()
                         .append_turn(
                             &project_for_task.path,
                             &project_for_task.id,
@@ -265,7 +267,7 @@ fn agent_get_session(
 ) -> Result<Vec<agent::session::AgentSessionMessage>, String> {
     let project = resolve_agent_project(&app, &project_id)?;
     Ok(app
-        .state::<agent::session::AgentSessionStore>()
+        .state::<Arc<agent::session::AgentSessionStore>>()
         .recent_messages(
             &project.path,
             &session_id,
@@ -280,7 +282,7 @@ fn agent_list_sessions(
 ) -> Result<Vec<agent::session::AgentSession>, String> {
     let project = resolve_agent_project(&app, &project_id)?;
     Ok(app
-        .state::<agent::session::AgentSessionStore>()
+        .state::<Arc<agent::session::AgentSessionStore>>()
         .list_sessions(&project.path))
 }
 
@@ -596,14 +598,30 @@ pub fn run() {
             app.manage(commands::claude_cli::ClaudeCliState::default());
             app.manage(commands::codex_cli::CodexCliState::default());
             app.manage(commands::file_sync::FileSyncState::default());
-            app.manage(agent::session::AgentSessionStore::default());
-            app.manage(agent::cancel::AgentCancellationRegistry::default());
+            // The agent session/cancellation registries are shared between
+            // the Tauri commands and the HTTP API server, so both manage the
+            // same Arc'd instances (see server_host::ServerHost below).
+            let sessions = Arc::new(agent::session::AgentSessionStore::default());
+            let cancellations = Arc::new(agent::cancel::AgentCancellationRegistry::default());
+            app.manage(sessions.clone());
+            app.manage(cancellations.clone());
             app.manage(CloseBehaviorState(Mutex::new("minimize".to_string())));
             app.manage(TrayAvailabilityState(Mutex::new(false)));
+            // Dedicated async runtime for HTTP-server work (agent chat
+            // turns, embedding, search) so the API layer never depends on
+            // the Tauri event-loop runtime. Lives for the whole process.
+            let server_runtime = server_host::build_server_runtime();
+            let server_host = server_host::ServerHost::new(
+                app.path().app_data_dir().ok().map(|dir| dir.join("app-state.json")),
+                sessions,
+                cancellations,
+                server_runtime.handle().clone(),
+            );
+            std::mem::forget(server_runtime);
             // Start the API before optional desktop integrations so the
             // backend is reachable if tray setup or another integration fails.
-            clip_server::start_clip_server(app.handle().clone());
-            api_server::start_api_server(app.handle().clone());
+            clip_server::start_clip_server(server_host.clone());
+            api_server::start_api_server(server_host);
             let tray_available = match tray::create_tray(app.handle()) {
                 Ok(()) => true,
                 Err(err) => {

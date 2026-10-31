@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use tauri::AppHandle;
 use tiny_http::{Header, Method, Response, Server};
 
 use crate::cors::{local_cors_headers, request_origin};
 use crate::server_bind;
+use crate::server_host::ServerHost;
 
 static CURRENT_PROJECT: Mutex<String> = Mutex::new(String::new());
 static ALL_PROJECTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new()); // (name, path)
@@ -14,7 +14,6 @@ static PENDING_CLIPS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new()); // 
 /// Daemon status: 0=starting, 1=running, 2=port_conflict, 3=error
 static DAEMON_STATUS: AtomicU8 = AtomicU8::new(0);
 
-const PORT: u16 = 19827;
 const MAX_BIND_RETRIES: u32 = 3;
 const MAX_RESTART_RETRIES: u32 = 10;
 const BIND_RETRY_DELAY_SECS: u64 = 2;
@@ -46,6 +45,14 @@ pub fn current_project_path() -> String {
         .unwrap_or_default()
 }
 
+/// Point project resolution (and the clip endpoint) at an explicit project
+/// directory. Used by the headless server via `LLM_WIKI_PROJECT_PATH`.
+pub fn set_current_project_path(path: &str) {
+    if let Ok(mut guard) = CURRENT_PROJECT.lock() {
+        *guard = path.replace('\\', "/");
+    }
+}
+
 pub fn all_projects() -> Vec<(String, String)> {
     ALL_PROJECTS
         .lock()
@@ -53,15 +60,16 @@ pub fn all_projects() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-pub fn start_clip_server(app: AppHandle) {
+pub fn start_clip_server(host: ServerHost) {
     thread::spawn(move || {
         let mut restart_count: u32 = 0;
 
         loop {
             // Try to bind the port with retries
             let (server, addr) = {
-                let host = server_bind::configured_bind_host(&app);
-                let addr = server_bind::bind_addr(&host, PORT);
+                let bind_host =
+                    server_bind::configured_bind_host(host.app_state_path().as_deref());
+                let addr = server_bind::bind_addr(&bind_host, server_bind::configured_clip_port());
                 let mut last_err = String::new();
                 let mut bound = None;
                 for attempt in 1..=MAX_BIND_RETRIES {
@@ -121,7 +129,7 @@ pub fn start_clip_server(app: AppHandle) {
                 // the same API token as port 19828; exposing clip/project
                 // endpoints without authentication would leak project paths
                 // and permit writes from every device on the network.
-                if !request_is_loopback(&request) && !request_is_authorized(&app, &request) {
+                if !request_is_loopback(&request) && !request_is_authorized(&host, &request) {
                     let mut response = Response::from_string(
                         r#"{"ok":false,"error":"Missing or invalid API token"}"#,
                     )
@@ -335,7 +343,7 @@ fn address_is_loopback(address: Option<&std::net::SocketAddr>) -> bool {
         .unwrap_or(false)
 }
 
-fn request_is_authorized(app: &AppHandle, request: &tiny_http::Request) -> bool {
+fn request_is_authorized(app: &ServerHost, request: &tiny_http::Request) -> bool {
     let headers = request
         .headers()
         .iter()

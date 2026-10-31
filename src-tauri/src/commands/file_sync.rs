@@ -343,6 +343,43 @@ pub fn rescan_project_files(
     source_watch_config: Option<SourceWatchConfig>,
     watch_roots_only: Option<bool>,
 ) -> Result<FileChangeRescanResult, String> {
+    rescan_core(
+        project_id.clone(),
+        project_path,
+        source_watch_config,
+        watch_roots_only,
+        Some(&|queue: &FileChangeQueue| emit_queue(&app, &project_id, queue)),
+        Some(&|tasks: Vec<FileChangeTask>| emit_changed_batch(&app, &project_id, tasks)),
+    )
+}
+
+/// Same rescan as the desktop command, but without frontend event
+/// emission — used by the API server, whose clients poll instead of
+/// listening to Tauri events.
+pub fn rescan_project_files_detached(
+    project_id: String,
+    project_path: String,
+    source_watch_config: Option<SourceWatchConfig>,
+    watch_roots_only: Option<bool>,
+) -> Result<FileChangeRescanResult, String> {
+    rescan_core(
+        project_id,
+        project_path,
+        source_watch_config,
+        watch_roots_only,
+        None,
+        None,
+    )
+}
+
+fn rescan_core(
+    project_id: String,
+    project_path: String,
+    source_watch_config: Option<SourceWatchConfig>,
+    watch_roots_only: Option<bool>,
+    on_queue: Option<&dyn Fn(&FileChangeQueue)>,
+    on_changed: Option<&dyn Fn(Vec<FileChangeTask>)>,
+) -> Result<FileChangeRescanResult, String> {
     run_guarded("rescan_project_files", || {
         let root = PathBuf::from(project_path);
         let source_watch_config = normalize_source_watch_config(source_watch_config);
@@ -352,9 +389,24 @@ pub fn rescan_project_files(
         } else {
             enqueue_rescan_changes(&root, &project_id, &source_watch_config)?;
         }
-        let changed_tasks = process_queue(&app, &root, &project_id)?;
+        let changed_tasks = process_queue_inner(
+            &root,
+            &project_id,
+            |queue| {
+                if let Some(on_queue) = on_queue {
+                    on_queue(queue);
+                }
+            },
+            |tasks| {
+                if let Some(on_changed) = on_changed {
+                    on_changed(tasks);
+                }
+            },
+        )?;
         let queue = with_queue_lock(&root, || read_queue(&root))?;
-        emit_queue(&app, &project_id, &queue);
+        if let Some(on_queue) = on_queue {
+            on_queue(&queue);
+        }
         Ok(FileChangeRescanResult {
             queue,
             changed_tasks,
