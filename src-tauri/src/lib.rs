@@ -7,6 +7,7 @@
 //! (`commands`). There is no GUI shell; see `headless` for startup.
 
 mod agent;
+mod api_docs;
 mod api_server;
 mod project_registry;
 mod commands;

@@ -233,6 +233,29 @@ fn process_request(app: ServerHost, mut request: tiny_http::Request) {
     };
 
     let (path, query) = split_url(&url);
+    if method == Method::Get && (path == "/docs" || path == "/docs/") {
+        // Human-readable API documentation; browsers authenticate via the
+        // query token since they cannot set Authorization headers.
+        if !is_token_authorized(&app, query, &headers) {
+            respond_error(
+                request,
+                401,
+                "Unauthorized: append ?token=<your token> to the URL",
+                origin.as_deref(),
+            );
+            return;
+        }
+        let html = crate::api_docs::render(&openapi_document());
+        let mut response = tiny_http::Response::from_string(html);
+        response.add_header(
+            tiny_http::Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap(),
+        );
+        for header in cors_headers(origin.as_deref()) {
+            response.add_header(header);
+        }
+        let _ = request.respond(response);
+        return;
+    }
     if wants_streaming_chat(&method, &path, &body, &headers) {
         if !api_enabled(&app) {
             respond_error(
@@ -324,6 +347,7 @@ fn handle_request(
             "mcpEnabled": api_mcp_enabled(app),
             "allowUnauthenticated": api_allow_unauthenticated(app),
             "allowLanAccess": api_allow_lan_access(app),
+            "docs": "/docs?token=<your token>",
             "agent": {
                 "chat": true,
                 "streaming": true,
