@@ -257,7 +257,7 @@ fn handle_request(
 
 
 
-fn is_agent_chat_request(method: &Method, path: &str) -> bool {
+pub(super) fn is_agent_chat_request(method: &Method, path: &str) -> bool {
     let Some(parts) = api_path_parts(path) else {
         return false;
     };
@@ -268,7 +268,7 @@ fn is_agent_chat_request(method: &Method, path: &str) -> bool {
         )
 }
 
-fn is_token_required_request(method: &Method, path: &str) -> bool {
+pub(super) fn is_token_required_request(method: &Method, path: &str) -> bool {
     if is_agent_chat_request(method, path) {
         return true;
     }
@@ -307,7 +307,7 @@ fn api_path_parts(path: &str) -> Option<Vec<&str>> {
     )
 }
 
-fn wants_streaming_chat(
+pub(super) fn wants_streaming_chat(
     method: &Method,
     path: &str,
     body: &str,
@@ -332,7 +332,7 @@ fn wants_streaming_chat(
     }
 }
 
-fn body_limit_for_request(method: &Method, url: &str) -> usize {
+pub(super) fn body_limit_for_request(method: &Method, url: &str) -> usize {
     let (path, _) = split_url(url);
     let parts = api_path_parts(&path);
     if method != &Method::Post {

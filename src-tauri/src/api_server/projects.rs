@@ -100,7 +100,7 @@ pub(super) fn resolve_project(app: &ServerHost, project_id: &str) -> Result<Proj
         .ok_or_else(|| format!("Unknown project: {project_id}"))
 }
 
-fn project_path_matches(stored_path: &str, candidate: &str) -> bool {
+pub(super) fn project_path_matches(stored_path: &str, candidate: &str) -> bool {
     let stored = normalize_path(stored_path);
     let candidate = normalize_path(candidate);
     if cfg!(windows) {

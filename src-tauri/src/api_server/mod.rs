@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 
 use std::io::Read;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
@@ -40,6 +40,13 @@ mod respond;
 use respond::{allow_request, ok, err, respond_error, respond_json, respond_options,
               should_rate_limit, ApiResponse};
 use router::{cors_headers, process_request};
+#[cfg(test)]
+use auth::constant_time_eq;
+#[cfg(test)]
+use projects::project_path_matches;
+#[cfg(test)]
+use router::{body_limit_for_request, is_agent_chat_request, is_token_required_request,
+             wants_streaming_chat};
 
 use params::{percent_decode, split_url};
 pub(crate) use params::parse_query;
