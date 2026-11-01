@@ -559,33 +559,6 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             parameters: None,
         },
         ToolSpec {
-            name: "skills.load".to_string(),
-            description: "Load instruction-only project skills from .llm-wiki/skills.".to_string(),
-            effects: vec![ToolEffect::Read],
-            parameters: None,
-        },
-        ToolSpec {
-            name: "skill.read_file".to_string(),
-            description:
-                "Read a text reference file from an active skill directory by relative path."
-                    .to_string(),
-            effects: vec![ToolEffect::Read],
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "skill": {
-                        "type": "string",
-                        "description": "Optional active skill name; required when multiple skills are active."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path inside the active skill directory, such as references/types.md."
-                    }
-                },
-                "required": ["path"]
-            })),
-        },
-        ToolSpec {
             name: "workspace.write_file".to_string(),
             description:
                 "Write a generated artifact file under the visible agent-workspace directory."
@@ -2931,8 +2904,6 @@ mod tests {
         assert!(names.contains(&"anytxt.search".to_string()));
         assert!(names.contains(&"wiki.write_page".to_string()));
         assert!(names.contains(&"llm.generate".to_string()));
-        assert!(names.contains(&"skills.load".to_string()));
-        assert!(names.contains(&"skill.read_file".to_string()));
         assert!(names.contains(&"workspace.write_file".to_string()));
         assert!(names.contains(&"workspace.append_file".to_string()));
         assert!(names.contains(&"shell.exec".to_string()));

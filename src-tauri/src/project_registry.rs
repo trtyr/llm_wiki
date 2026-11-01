@@ -32,3 +32,14 @@ pub fn all_projects() -> Vec<(String, String)> {
         .map(|guard| guard.clone())
         .unwrap_or_default()
 }
+
+/// Permanently list a project in this server session (so it stays
+/// addressable even after `current` moves to another project).
+pub fn register_project(name: &str, path: &str) {
+    if let Ok(mut guard) = ALL_PROJECTS.lock() {
+        let normalized = path.replace('\\', "/");
+        if !guard.iter().any(|(_, existing)| existing == &normalized) {
+            guard.push((name.to_string(), normalized));
+        }
+    }
+}

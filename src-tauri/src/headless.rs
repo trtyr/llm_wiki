@@ -161,6 +161,13 @@ fn ensure_registered_project() -> Result<(), String> {
         eprintln!("[llm-server] scaffolded new project at {}", root.display());
     }
     project_registry::set_current_project_path(&path);
+    project_registry::register_project(
+        Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Project"),
+        &path,
+    );
     eprintln!("[llm-server] project: {path} (exposed as \"current\")");
     Ok(())
 }

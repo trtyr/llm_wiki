@@ -77,16 +77,6 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Build MCP server bundle
-        run: |
-          npm --prefix mcp-server ci
-          npm --prefix mcp-server run build
-
       - name: Build llm-server (release)
         working-directory: src-tauri
         run: cargo build --release --bin llm-server
@@ -96,13 +86,11 @@ jobs:
         run: |
           VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*//')
           NAME="llm-wiki-server-${VERSION}-${{ matrix.platform }}"
-          mkdir -p "dist-server/$NAME/mcp-server" "dist-server/$NAME/pdfium"
+          mkdir -p "dist-server/$NAME/pdfium"
           EXE="target/release/llm-server"
           [ -f "$EXE.exe" ] && EXE="$EXE.exe"
           cp "src-tauri/$EXE" "dist-server/$NAME/"
           cp "src-tauri/pdfium/${{ matrix.pdfium }}" "dist-server/$NAME/pdfium/"
-          cp -r mcp-server/dist "dist-server/$NAME/mcp-server/dist"
-          cp mcp-server/package.json "dist-server/$NAME/mcp-server/"
           echo "$NAME" > dist-server/artifact-name.txt
           (cd dist-server && tar -czf "$NAME.tar.gz" "$NAME")
           ls -la dist-server

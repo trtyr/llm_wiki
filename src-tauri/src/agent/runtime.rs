@@ -4122,55 +4122,6 @@ mod tests {
         assert!(!error.contains("Router intent="));
     }
 
-    #[tokio::test]
-    async fn planner_unavailable_skill_turn_does_not_fall_back_to_wiki_search() {
-        let project = temp_project("skill-no-fallback");
-        fs::create_dir_all(project.join(".llm-wiki").join("skills").join("demo")).unwrap();
-        fs::write(
-            project
-                .join(".llm-wiki")
-                .join("skills")
-                .join("demo")
-                .join("SKILL.md"),
-            "---\nname: demo\ndescription: Demo skill\n---\nUse this skill for demos.",
-        )
-        .unwrap();
-        fs::write(
-            project.join("wiki").join("concepts").join("skills.md"),
-            "---\ntitle: Skills\n---\n# Skills\n\nThis page should not be retrieved.",
-        )
-        .unwrap();
-
-        let runtime = AgentRuntime::new(
-            "project-1",
-            project.to_string_lossy(),
-            None,
-            None,
-            None,
-            None,
-        );
-        let error = runtime
-            .run_once(AgentChatRequest {
-                message: "你现在有哪些 skill 可以使用？".to_string(),
-                session_id: Some("s1".to_string()),
-                mode: AgentMode::Standard,
-                tools: AgentToolOptions {
-                    wiki: true,
-                    web: false,
-                    anytxt: false,
-                },
-                top_k: Some(3),
-                include_content: Some(false),
-                history: Vec::new(),
-                skills: vec!["demo".to_string()],
-                skill_mode: AgentSkillMode::Auto,
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
-
-        assert!(error.contains("Chat model is unavailable"));
-    }
 
     #[tokio::test]
     async fn run_once_rejects_empty_message() {

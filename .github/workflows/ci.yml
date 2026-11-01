@@ -48,9 +48,3 @@ jobs:
       - name: Rust tests
         working-directory: src-tauri
         run: cargo test --lib
-
-      - name: Build and test MCP server
-        run: |
-          npm --prefix mcp-server ci
-          npm --prefix mcp-server run build
-          npm --prefix mcp-server test

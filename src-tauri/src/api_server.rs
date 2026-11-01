@@ -331,6 +331,11 @@ fn handle_request(
             },
         }));
     }
+    if method == &Method::Get
+        && (path == "/openapi.json" || path == "/" || path == format!("{API_PREFIX}/openapi.json"))
+    {
+        return ok(openapi_document());
+    }
     if !path.starts_with(API_PREFIX) {
         return err(404, "Not found");
     }
@@ -350,7 +355,7 @@ fn handle_request(
     }
     if !matches!(
         method,
-        &Method::Get | &Method::Post | &Method::Patch | &Method::Delete
+        &Method::Get | &Method::Post | &Method::Put | &Method::Patch | &Method::Delete
     ) {
         return err(405, "Method not allowed");
     }
@@ -361,6 +366,10 @@ fn handle_request(
 
     match (method, parts.as_slice()) {
         (&Method::Get, ["projects"]) => handle_projects(app),
+        (&Method::Post, ["projects", "create"]) => handle_create_project(app, body),
+        (&Method::Post, ["projects", "current"]) => handle_set_current_project(app, body),
+        (&Method::Get, ["settings"]) => handle_get_settings(app),
+        (&Method::Put, ["settings"]) => handle_put_settings(app, body),
         (&Method::Get, ["projects", project_id, "files"]) => handle_files(app, project_id, query),
         (&Method::Get, ["projects", project_id, "files", "content"]) => {
             handle_file_content(app, project_id, query)
@@ -392,6 +401,24 @@ fn handle_request(
             handle_write_page(app, project_id, body)
         }
         (&Method::Post, ["projects", project_id, "chat"]) => handle_chat(app, project_id, body),
+        (&Method::Get, ["projects", project_id, "history"]) => {
+            handle_list_file_history(app, project_id, query)
+        }
+        (&Method::Post, ["projects", project_id, "history", "restore"]) => {
+            handle_restore_file_history(app, project_id, body)
+        }
+        (&Method::Get, ["projects", project_id, "history", "stats"]) => {
+            handle_file_history_stats(app, project_id)
+        }
+        (&Method::Get, ["projects", project_id, "history", "settings"]) => {
+            handle_get_history_settings(app, project_id)
+        }
+        (&Method::Put, ["projects", project_id, "history", "settings"]) => {
+            handle_put_history_settings(app, project_id, body)
+        }
+        (&Method::Post, ["projects", project_id, "maintenance", "rebuild-index"]) => {
+            handle_rebuild_index(app, project_id)
+        }
         (&Method::Post, ["projects", project_id, "chat", session_id, "cancel"]) => {
             handle_cancel_chat(app, project_id, session_id)
         }
@@ -3052,6 +3079,242 @@ fn load_source_watch_config(
         )
         .ok()
     })
+}
+
+const OPENAPI_JSON: &str = include_str!("../openapi.json");
+
+fn openapi_document() -> Value {
+    static PARSED: OnceLock<Value> = OnceLock::new();
+    PARSED
+        .get_or_init(|| serde_json::from_str(OPENAPI_JSON).unwrap_or(Value::Null))
+        .clone()
+}
+
+/// GET /api/v1/settings — returns the merged app-state configuration
+/// (llmConfig, embeddingConfig, searchApiConfig, apiConfig, ...). This is
+/// the owner's endpoint: values are NOT masked, the bearer token gates it.
+fn handle_get_settings(app: &ServerHost) -> ApiResponse {
+    let Some(path) = app.app_state_path() else {
+        return err(404, "No app-state file in this deployment");
+    };
+    match fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(value) => ok(value),
+            Err(e) => err(500, format!("app-state.json is not valid JSON: {e}")),
+        },
+        Err(_) => ok(json!({})),
+    }
+}
+
+/// PUT /api/v1/settings — merges top-level config sections (llmConfig,
+/// embeddingConfig, searchApiConfig, apiConfig, ...) into app-state.json.
+/// Unknown keys are preserved; the config cache is invalidated immediately.
+fn handle_put_settings(app: &ServerHost, body: &str) -> ApiResponse {
+    let Some(path) = app.app_state_path() else {
+        return err(404, "No app-state file in this deployment");
+    };
+    let update: Value = match serde_json::from_str::<Value>(body) {
+        Ok(v) if v.is_object() => v,
+        _ => return err(400, "Body must be a JSON object of config sections"),
+    };
+    let mut merged: Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    {
+        let Some(map) = merged.as_object_mut() else {
+            return err(500, "app-state.json root is not an object");
+        };
+        if let Some(update_map) = update.as_object() {
+            for (key, value) in update_map {
+                map.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if let Err(e) = fs::write(&path, serde_json::to_string_pretty(&merged).unwrap_or_default()) {
+        return err(500, format!("Failed to write app-state.json: {e}"));
+    }
+    invalidate_config_cache();
+    ok(merged)
+}
+
+/// POST /api/v1/projects/create — scaffold a new wiki project directory
+/// (wiki/, raw/sources/, purpose.md, schema.md, .llm-wiki/project.json)
+/// and pin it as the "current" project.
+fn handle_create_project(_app: &ServerHost, body: &str) -> ApiResponse {
+    #[derive(Deserialize)]
+    struct CreateProjectRequest {
+        name: String,
+        path: String,
+    }
+    let req: CreateProjectRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return err(400, format!("Invalid JSON: {e}")),
+    };
+    let project = match commands::project::create_project(req.name.clone(), req.path.clone()) {
+        Ok(project) => project,
+        Err(e) => return err(400, e),
+    };
+    project_registry::register_project(&req.name, &project.path);
+    project_registry::set_current_project_path(&project.path);
+    invalidate_graph_cache(&project.path);
+    ok(json!({
+        "ok": true,
+        "project": project,
+        "note": "registered as the current project; chat/search accept project_id 'current'",
+    }))
+}
+
+/// POST /api/v1/projects/current — body {path}: re-pin the project that
+/// "current" refers to (replaces the old MCP set_project capability).
+fn handle_set_current_project(_app: &ServerHost, body: &str) -> ApiResponse {
+    #[derive(Deserialize)]
+    struct SetCurrentRequest {
+        path: String,
+    }
+    let req: SetCurrentRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return err(400, format!("Invalid JSON: {e}")),
+    };
+    let root = std::path::PathBuf::from(&req.path);
+    if !root.is_dir() {
+        return err(404, format!("Project directory not found: {}", req.path));
+    }
+    project_registry::register_project(
+        root.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Project"),
+        &req.path,
+    );
+    project_registry::set_current_project_path(&req.path);
+    invalidate_config_cache();
+    ok(json!({ "ok": true, "current": req.path.replace('\\', "/") }))
+}
+
+/// GET /api/v1/projects/{id}/history?path=<rel> — version list of one
+/// project file, newest first.
+fn handle_list_file_history(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let params = parse_query(query);
+    let Some(rel) = params.get("path") else {
+        return err(400, "Missing path query parameter");
+    };
+    let abs_path = std::path::Path::new(&project.path).join(rel);
+    let abs_path = abs_path.to_string_lossy().into_owned();
+    match app.block_on(commands::file_history::list_file_history(
+        project.path.clone(),
+        abs_path,
+    )) {
+        Ok(entries) => ok(json!({
+            "ok": true,
+            "projectId": project.id,
+            "path": rel,
+            "entries": entries,
+        })),
+        Err(e) => err(404, e),
+    }
+}
+
+/// POST /api/v1/projects/{id}/history/restore — body {path, entryId}.
+fn handle_restore_file_history(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    #[derive(Deserialize)]
+    struct RestoreRequest {
+        path: String,
+        #[serde(rename = "entryId")]
+        entry_id: String,
+    }
+    let req: RestoreRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return err(400, format!("Invalid JSON: {e}")),
+    };
+    let abs_path = std::path::Path::new(&project.path).join(&req.path);
+    let abs_path = abs_path.to_string_lossy().into_owned();
+    match app.block_on(commands::file_history::restore_file_history(
+        project.path.clone(),
+        abs_path,
+        req.entry_id.clone(),
+    )) {
+        Ok(message) => {
+            invalidate_graph_cache(&project.path);
+            ok(json!({
+                "ok": true,
+                "projectId": project.id,
+                "path": req.path,
+                "restored": req.entry_id,
+                "message": message,
+            }))
+        }
+        Err(e) => err(400, e),
+    }
+}
+
+/// GET /api/v1/projects/{id}/history/stats
+fn handle_file_history_stats(app: &ServerHost, project_id: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    match app.block_on(commands::file_history::get_file_history_stats(
+        project.path.clone(),
+    )) {
+        Ok(stats) => ok(json!({ "ok": true, "projectId": project.id, "stats": stats })),
+        Err(e) => err(500, e),
+    }
+}
+
+/// GET /api/v1/projects/{id}/history/settings
+fn handle_get_history_settings(app: &ServerHost, project_id: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    match app.block_on(commands::file_history::get_file_history_settings(
+        project.path.clone(),
+    )) {
+        Ok(settings) => ok(json!({ "ok": true, "projectId": project.id, "settings": settings })),
+        Err(e) => err(500, e),
+    }
+}
+
+/// PUT /api/v1/projects/{id}/history/settings
+fn handle_put_history_settings(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let parsed = match serde_json::from_str(body) {
+        Ok(parsed) => parsed,
+        Err(e) => return err(400, format!("Invalid JSON: {e}")),
+    };
+    match app.block_on(commands::file_history::set_file_history_settings(
+        project.path.clone(),
+        parsed,
+    )) {
+        Ok(settings) => ok(json!({ "ok": true, "projectId": project.id, "settings": settings })),
+        Err(e) => err(400, e),
+    }
+}
+
+/// POST /api/v1/projects/{id}/maintenance/rebuild-index — regenerates
+/// wiki/index.md from the current page set.
+fn handle_rebuild_index(app: &ServerHost, project_id: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    match app.block_on(commands::project_maintenance::rebuild_wiki_index(
+        project.path.clone(),
+    )) {
+        Ok(result) => ok(json!({ "ok": true, "projectId": project.id, "result": result })),
+        Err(e) => err(500, e),
+    }
 }
 
 #[cfg(test)]

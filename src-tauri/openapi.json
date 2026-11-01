@@ -1,0 +1,296 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "LLM Wiki Backend API",
+    "version": "0.6.13",
+    "description": "Headless personal knowledge base service. All routes (except /health and this document) require Bearer auth: Authorization: Bearer <token>. Config token: env LLM_WIKI_API_TOKEN or apiConfig.token in app-state.json."
+  },
+  "servers": [{ "url": "/" }],
+  "security": [{ "bearerAuth": [] }],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer" }
+    }
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Liveness/configuration report (no auth)",
+        "responses": { "200": { "description": "ok, status, version, auth flags" } }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This document (no auth)",
+        "responses": { "200": { "description": "OpenAPI 3.1 document" } }
+      }
+    },
+    "/api/v1/settings": {
+      "get": {
+        "summary": "Read full app-state configuration (llmConfig, embeddingConfig, searchApiConfig, apiConfig, ...). Values are not masked; bearer token is the gate.",
+        "responses": {
+          "200": { "description": "Config object", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "401": { "description": "Unauthorized" }
+        }
+      },
+      "put": {
+        "summary": "Merge top-level config sections into app-state.json (unknown keys preserved; config cache invalidated immediately)",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true }, "example": { "llmConfig": { "provider": "custom", "customEndpoint": "https://llm.example.com/v1", "apiKey": "sk-...", "model": "your-model" } } } }
+        },
+        "responses": {
+          "200": { "description": "Merged config object" },
+          "400": { "description": "Body must be a JSON object" },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/projects": {
+      "get": {
+        "summary": "List known projects (with currentProject)",
+        "responses": { "200": { "description": "{ ok, projects: [{id,name,path,current}], currentProject }" } }
+      }
+    },
+    "/api/v1/projects/create": {
+      "post": {
+        "summary": "Scaffold a new wiki project and pin it as 'current'",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["name", "path"], "properties": { "name": { "type": "string" }, "path": { "type": "string", "description": "Parent directory; the project is created at <path>/<name>" } } } } }
+        },
+        "responses": { "200": { "description": "{ ok, project }" }, "400": { "description": "Directory exists or invalid input" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/files": {
+      "get": {
+        "summary": "List project files as a tree",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Project UUID, filesystem path, or 'current'" },
+          { "name": "root", "in": "query", "schema": { "type": "string", "enum": ["wiki", "sources", "all"] } },
+          { "name": "recursive", "in": "query", "schema": { "type": "boolean", "default": true } },
+          { "name": "maxFiles", "in": "query", "schema": { "type": "integer" } }
+        ],
+        "responses": { "200": { "description": "{ ok, files: [{name,path,isDir,children}] }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/files/content": {
+      "get": {
+        "summary": "Read one text file (wiki/, raw/sources/, purpose.md, schema.md)",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "path", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "{ ok, path, content }" }, "404": { "description": "Not found" } }
+      },
+      "delete": {
+        "summary": "Delete one file. A restorable version is recorded in file history first; wiki pages also get their vector entries dropped.",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "path", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "{ ok, deleted, historyRecorded, vectorsCleared }" }, "403": { "description": "Path outside the public surface" }, "404": { "description": "File not found" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/pages/write": {
+      "post": {
+        "summary": "Create or overwrite one wiki Markdown page (create-only unless allowOverwrite)",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["path", "content"], "properties": { "path": { "type": "string", "description": "Project-relative path under wiki/, ending in .md" }, "content": { "type": "string" }, "allowOverwrite": { "type": "boolean", "default": false } } } } }
+        },
+        "responses": { "200": { "description": "{ ok, result: { path, bytes, verified, existedBefore } }" }, "409": { "description": "Exists without allowOverwrite" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/pages/embed": {
+      "post": {
+        "summary": "Index one wiki page into the vector store (requires embeddingConfig)",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["path"], "properties": { "path": { "type": "string" }, "force": { "type": "boolean" } } } } }
+        },
+        "responses": { "200": { "description": "{ ok, result: { pageId, chunks, vectorsWritten, status } }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/history": {
+      "get": {
+        "summary": "Version list of one project file (newest first)",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "path", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "{ ok, entries: [{id, author, tool, createdAt, ...}] }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/history/restore": {
+      "post": {
+        "summary": "Restore one file version",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["path", "entryId"], "properties": { "path": { "type": "string" }, "entryId": { "type": "string" } } } } }
+        },
+        "responses": { "200": { "description": "{ ok, restored }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/history/stats": {
+      "get": {
+        "summary": "File-history store statistics",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "{ ok, stats }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/history/settings": {
+      "get": {
+        "summary": "Read file-history settings",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "{ ok, settings }" } }
+      },
+      "put": {
+        "summary": "Update file-history settings",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "properties": { "enabled": { "type": "boolean" }, "maxVersionsPerFile": { "type": "integer" } } } } }
+        },
+        "responses": { "200": { "description": "{ ok, settings }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/maintenance/rebuild-index": {
+      "post": {
+        "summary": "Regenerate wiki/index.md from the current page set",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "{ ok, result }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/reviews": {
+      "get": {
+        "summary": "List review items (filters: status, type, limit)",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "{ ok, reviews: [...] }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/reviews/resolve": {
+      "post": {
+        "summary": "Bulk-resolve review items",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "{ ok, ... }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/reviews/{reviewId}": {
+      "patch": {
+        "summary": "Update one review item (predefined actions)",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "reviewId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+        "responses": { "200": { "description": "{ ok, ... }" } }
+      },
+      "delete": {
+        "summary": "Delete one review item",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "reviewId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "{ ok }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/search": {
+      "post": {
+        "summary": "Hybrid search: keyword + vector (when embedding configured) + one-hop graph",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "topK": { "type": "integer" }, "includeContent": { "type": "boolean" }, "queryEmbedding": { "type": "array", "items": { "type": "number" } } } } } }
+        },
+        "responses": { "200": { "description": "{ ok, mode, tokenHits, vectorHits, graphHits, results }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/graph": {
+      "get": {
+        "summary": "Knowledge graph (nodes/edges; q filters to a node neighborhood)",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "q", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" } }
+        ],
+        "responses": { "200": { "description": "{ ok, nodes, edges }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/sources/rescan": {
+      "post": {
+        "summary": "Rescan raw/sources into the change queue (ingest orchestration is external)",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "{ ok, result }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/chat": {
+      "post": {
+        "summary": "Agent chat: blocking JSON response, or SSE stream with Accept: text/event-stream (events: meta, agentStart, turnStart, messageDelta, toolStart/End, referenceAdded, error, done; ': keepalive' heartbeats). mode: standard|deep.",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["message"],
+                "properties": {
+                  "message": { "type": "string" },
+                  "sessionId": { "type": "string" },
+                  "runId": { "type": "string" },
+                  "mode": { "type": "string", "enum": ["standard", "deep"] },
+                  "retrievalMode": { "type": "string" },
+                  "tools": { "type": "object", "description": "Tool toggles (web, anytxt, skills is inert)" },
+                  "topK": { "type": "integer" },
+                  "includeContent": { "type": "boolean" },
+                  "history": { "type": "array", "items": { "type": "object", "properties": { "role": { "type": "string" }, "content": { "type": "string" } } } },
+                  "historyExplicit": { "type": "boolean" },
+                  "persistSession": { "type": "boolean" },
+                  "stream": { "type": "boolean", "description": "Same effect as the Accept header" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Blocking: { ok, sessionId, mode, message: {role, content}, references, toolEvents, events, usage }. Streaming: text/event-stream" },
+          "401": { "description": "Chat is always token-gated" },
+          "502": { "description": "LLM upstream error" }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/chat/sessions": {
+      "get": {
+        "summary": "List persisted chat sessions (newest first)",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "{ ok, sessions: [{sessionId, projectId, messages, updatedAt}] }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/chat/sessions/{sessionId}": {
+      "get": {
+        "summary": "Last N messages of one chat session",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 40, "maximum": 200 } }
+        ],
+        "responses": { "200": { "description": "{ ok, messages: [{role, content, timestamp}] }" } }
+      }
+    },
+    "/api/v1/projects/{projectId}/chat/{sessionId}/cancel": {
+      "post": {
+        "summary": "Cancel a running agent turn",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "{ ok, cancelled }" } }
+      }
+    }
+  }
+}
