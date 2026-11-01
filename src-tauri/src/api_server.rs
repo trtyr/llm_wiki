@@ -392,8 +392,20 @@ fn handle_request(
         (&Method::Get, ["projects"]) => handle_projects(app),
         (&Method::Post, ["projects", "create"]) => handle_create_project(app, body),
         (&Method::Post, ["projects", "current"]) => handle_set_current_project(app, body),
-        (&Method::Get, ["settings"]) => handle_get_settings(app),
-        (&Method::Put, ["settings"]) => handle_put_settings(app, body),
+        (&Method::Get, ["settings"]) => {
+            // Config carries every provider key: it always requires a real
+            // token, even when allowUnauthenticated opens read routes.
+            if !is_token_authorized(app, query, headers) {
+                return err(401, "settings require a token (never unauthenticated)");
+            }
+            handle_get_settings(app)
+        }
+        (&Method::Put, ["settings"]) => {
+            if !is_token_authorized(app, query, headers) {
+                return err(401, "settings require a token (never unauthenticated)");
+            }
+            handle_put_settings(app, body)
+        }
         (&Method::Get, ["projects", project_id, "files"]) => handle_files(app, project_id, query),
         (&Method::Get, ["projects", project_id, "files", "content"]) => {
             handle_file_content(app, project_id, query)
@@ -983,7 +995,7 @@ fn handle_delete_file(app: &ServerHost, project_id: &str, query: &str) -> ApiRes
     if !path.is_file() {
         return err(404, format!("File not found: {rel}"));
     }
-    commands::file_history::record_file_version(&path, "api", "api.files.delete");
+    let history_recorded = commands::file_history::record_file_version(&path, "api", "api.files.delete");
     if let Err(e) = fs::remove_file(&path) {
         return err(500, format!("Failed to delete file: {e}"));
     }
@@ -1001,13 +1013,17 @@ fn handle_delete_file(app: &ServerHost, project_id: &str, query: &str) -> ApiRes
     }
     invalidate_graph_cache(&project.path);
 
-    ok(json!({
+    let mut body = json!({
         "ok": true,
         "projectId": project.id,
         "deleted": normalize_path(rel),
-        "historyRecorded": true,
+        "historyRecorded": history_recorded,
         "vectorsCleared": vectors_cleared,
-    }))
+    });
+    if !history_recorded {
+        body["hint"] = json!("file history is disabled for this project; PUT /history/settings {enabled:true} to make deletions restorable");
+    }
+    ok(body)
 }
 
 fn handle_files(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse {
@@ -3123,7 +3139,10 @@ fn handle_get_settings(app: &ServerHost) -> ApiResponse {
     };
     match fs::read_to_string(&path) {
         Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-            Ok(value) => ok(value),
+            Ok(mut value) => {
+                mask_secrets(&mut value);
+                ok(value)
+            }
             Err(e) => err(500, format!("app-state.json is not valid JSON: {e}")),
         },
         Err(_) => ok(json!({})),
@@ -3145,27 +3164,82 @@ fn handle_put_settings(app: &ServerHost, body: &str) -> ApiResponse {
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .unwrap_or_else(|| json!({}));
-    {
-        let Some(map) = merged.as_object_mut() else {
-            return err(500, "app-state.json root is not an object");
-        };
-        if let Some(update_map) = update.as_object() {
-            for (key, value) in update_map {
-                if value.is_null() {
-                    // null deletes the section/key — the only removal path
-                    // in a merge-only endpoint.
-                    map.remove(key);
+    deep_merge_masked(&mut merged, &update);
+    // Atomic write: a torn app-state.json loses the API token and every
+    // provider key on restart, so write-then-rename, never in-place.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = fs::write(&tmp, serde_json::to_string_pretty(&merged).unwrap_or_default()) {
+        let _ = fs::remove_file(&tmp);
+        return err(500, format!("Failed to write app-state.json: {e}"));
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return err(500, format!("Failed to replace app-state.json: {e}"));
+    }
+    invalidate_config_cache();
+    ok(mask_secrets(&mut merged).clone())
+}
+
+const SECRET_MASK: &str = "********";
+
+/// Recursively mask values under credential-bearing keys (`apiKey`,
+/// `token`, `accessToken`) for GET responses.
+fn mask_secrets(value: &mut Value) -> &mut Value {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                let lower = key.to_lowercase();
+                if lower == "apikey" || lower == "token" || lower == "accesstoken" {
+                    if !item.is_null() {
+                        *item = Value::String(SECRET_MASK.to_string());
+                    }
                 } else {
-                    map.insert(key.clone(), value.clone());
+                    mask_secrets(item);
                 }
             }
         }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                mask_secrets(item);
+            }
+        }
+        _ => {}
     }
-    if let Err(e) = fs::write(&path, serde_json::to_string_pretty(&merged).unwrap_or_default()) {
-        return err(500, format!("Failed to write app-state.json: {e}"));
+    value
+}
+
+/// Deep merge for PUT /settings semantics:
+/// - object + object merges recursively
+/// - `null` deletes the key
+/// - the secret mask `"********"` keeps the existing value (round-trip
+///   safe: masked GET output can be PUT back without leaking or losing keys)
+fn deep_merge_masked(existing: &mut Value, update: &Value) {
+    if let (Some(existing_map), Some(update_map)) =
+        (existing.as_object_mut(), update.as_object())
+    {
+        for (key, update_value) in update_map {
+            if update_value.is_null() {
+                existing_map.remove(key);
+                continue;
+            }
+            let masked = update_value.as_str() == Some(SECRET_MASK);
+            let nested = existing_map
+                .get(key)
+                .map(|current| current.is_object() && update_value.is_object())
+                .unwrap_or(false);
+            if nested {
+                deep_merge_masked(existing_map.get_mut(key).unwrap(), update_value);
+            } else if masked {
+                // keep whatever already exists; if nothing exists, record
+                // the mask so the operator sees it is unset-by-design
+                existing_map
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::String(SECRET_MASK.to_string()));
+            } else {
+                existing_map.insert(key.clone(), update_value.clone());
+            }
+        }
     }
-    invalidate_config_cache();
-    ok(merged)
 }
 
 /// POST /api/v1/projects/create — scaffold a new wiki project directory
@@ -3181,7 +3255,27 @@ fn handle_create_project(_app: &ServerHost, body: &str) -> ApiResponse {
         Ok(req) => req,
         Err(e) => return err(400, format!("Invalid JSON: {e}")),
     };
-    let project = match commands::project::create_project(req.name.clone(), req.path.clone()) {
+    // Path-safety: `name` must be a single safe path component (it is
+    // joined onto `path`), and `path` must be an existing directory. This
+    // endpoint can write files, so it does not accept traversal or
+    // arbitrary new locations.
+    let name = req.name.trim();
+    if name.is_empty() {
+        return err(400, "name is required");
+    }
+    if name.len() > 120 {
+        return err(400, "name is too long (max 120 characters)");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') {
+        return err(400, "invalid name: use a single path component without '..' or leading dots");
+    }
+    let parent = std::path::Path::new(req.path.trim());
+    match fs::metadata(parent) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return err(400, "path must be an existing directory"),
+        Err(e) => return err(400, format!("parent path does not exist: {e}")),
+    }
+    let project = match commands::project::create_project(name.to_string(), req.path.clone()) {
         Ok(project) => project,
         Err(e) => return err(400, e),
     };

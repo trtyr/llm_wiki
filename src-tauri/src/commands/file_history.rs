@@ -235,37 +235,40 @@ fn prune_entries_per_file(root: &Path, max_versions: usize) -> Result<(), String
     Ok(())
 }
 
-pub fn record_file_version(path: &Path, author: &str, tool: &str) {
+/// Returns whether a version was actually recorded. History is off by
+/// default (`enabled: false`), so callers must not claim restore safety
+/// without checking this.
+pub fn record_file_version(path: &Path, author: &str, tool: &str) -> bool {
     let Some(root) = project_root_for(path) else {
-        return;
+        return false;
     };
     if path.starts_with(root.join(".llm-wiki")) {
-        return;
+        return false;
     }
     let Ok(_guard) = HISTORY_LOCK.lock() else {
-        return;
+        return false;
     };
     let settings = read_history_settings(&root);
     if !settings.enabled || settings.max_versions_per_file == 0 {
-        return;
+        return false;
     }
     let Ok(metadata) = fs::metadata(path) else {
-        return;
+        return false;
     };
     if !metadata.is_file() || metadata.len() as usize > MAX_HISTORY_CONTENT_BYTES {
-        return;
+        return false;
     }
     let Ok(content) = fs::read_to_string(path) else {
-        return;
+        return false;
     };
     let Ok(dir) = checked_history_dir(&root, true) else {
-        return;
+        return false;
     };
     let Ok(checked_store_path) = checked_history_file(&root, path) else {
-        return;
+        return false;
     };
     let Some(file_name) = checked_store_path.file_name().map(ToOwned::to_owned) else {
-        return;
+        return false;
     };
     let store_path = dir.join(file_name);
     let mut entries: Vec<FileHistoryEntry> = fs::read_to_string(&store_path)
@@ -273,7 +276,7 @@ pub fn record_file_version(path: &Path, author: &str, tool: &str) {
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
     if entries.last().is_some_and(|entry| entry.content == content) {
-        return;
+        return false;
     }
     entries.push(FileHistoryEntry {
         id: Uuid::new_v4().to_string(),
@@ -286,11 +289,14 @@ pub fn record_file_version(path: &Path, author: &str, tool: &str) {
     if entries.len() > settings.max_versions_per_file {
         entries.drain(..entries.len() - settings.max_versions_per_file);
     }
+    let mut recorded = false;
     if let Ok(raw) = serde_json::to_string(&entries) {
         if fs::write(&store_path, raw).is_ok() {
+            recorded = true;
             prune_history_store(&root, &store_path);
         }
     }
+    recorded
 }
 
 pub async fn get_file_history_settings(
