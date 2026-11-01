@@ -3127,7 +3127,13 @@ fn handle_put_settings(app: &ServerHost, body: &str) -> ApiResponse {
         };
         if let Some(update_map) = update.as_object() {
             for (key, value) in update_map {
-                map.insert(key.clone(), value.clone());
+                if value.is_null() {
+                    // null deletes the section/key — the only removal path
+                    // in a merge-only endpoint.
+                    map.remove(key);
+                } else {
+                    map.insert(key.clone(), value.clone());
+                }
             }
         }
     }
@@ -3158,9 +3164,30 @@ fn handle_create_project(_app: &ServerHost, body: &str) -> ApiResponse {
     project_registry::register_project(&req.name, &project.path);
     project_registry::set_current_project_path(&project.path);
     invalidate_graph_cache(&project.path);
+    let project_id = match read_project_id(&project.path) {
+        Some(id) => id,
+        None => {
+            // Newly scaffolded projects have no identity file yet; give
+            // them one so API clients can address them by a stable UUID.
+            let id = uuid::Uuid::new_v4().to_string();
+            let meta_dir = std::path::Path::new(&project.path).join(".llm-wiki");
+            if fs::create_dir_all(&meta_dir).is_ok() {
+                let payload = json!({ "id": id, "name": project.name });
+                let _ = fs::write(
+                    meta_dir.join("project.json"),
+                    serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                );
+            }
+            id
+        }
+    };
     ok(json!({
         "ok": true,
-        "project": project,
+        "project": {
+            "id": project_id,
+            "name": project.name,
+            "path": project.path,
+        },
         "note": "registered as the current project; chat/search accept project_id 'current'",
     }))
 }

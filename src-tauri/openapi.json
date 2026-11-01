@@ -34,7 +34,7 @@
         }
       },
       "put": {
-        "summary": "Merge top-level config sections into app-state.json (unknown keys preserved; config cache invalidated immediately)",
+        "summary": "Merge top-level config sections into app-state.json (unknown keys preserved, null value deletes a key, config cache invalidated immediately)",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true }, "example": { "llmConfig": { "provider": "custom", "customEndpoint": "https://llm.example.com/v1", "apiKey": "sk-...", "model": "your-model" } } } }

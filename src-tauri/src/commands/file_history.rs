@@ -110,7 +110,11 @@ fn project_root_for(path: &Path) -> Option<PathBuf> {
 }
 
 fn history_path(root: &Path, path: &Path) -> PathBuf {
-    let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+    // Normalize separators: callers join paths with mixed `/` and \\
+    // (canonicalized paths arrive with \\), and the store address must
+    // depend only on the logical relative path.
+    let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy()
+        .replace('\\', "/");
     // Fixed FNV-1a keeps history addresses stable across Rust/toolchain upgrades.
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in relative.as_bytes() {
