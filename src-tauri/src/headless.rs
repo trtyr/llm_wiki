@@ -1,5 +1,4 @@
-//! Headless server mode: run the API + clip servers without the Tauri
-//! desktop shell.
+//! Headless server mode: the LLM Wiki API server without any GUI shell.
 //!
 //! Configuration is environment-driven so the same binary can be run from
 //! a terminal, a service manager, or (later) a public server:
@@ -10,8 +9,6 @@
 //! - `LLM_WIKI_BIND_HOST`   bind address (default `127.0.0.1`,
 //!                          `0.0.0.0` exposes to the network)
 //! - `LLM_WIKI_BIND_PORT`   API port (default `19828`)
-//! - `LLM_WIKI_CLIP_PORT`   clip-server port (default `19827`)
-//! - `LLM_WIKI_CLIP_SERVER` set to `0` to skip the clip server
 //! - `LLM_WIKI_PROJECT_PATH` project directory exposed as the current
 //!                          project; scaffolded if it does not exist yet
 //! - `LLM_WIKI_API_TOKEN`   API token (also read from `app-state.json`)
@@ -25,7 +22,7 @@ use serde_json::json;
 
 use crate::server_bind;
 use crate::server_host::{self, ServerHost};
-use crate::{api_server, clip_server, proxy};
+use crate::{api_server, project_registry, proxy};
 
 const APP_IDENTIFIER: &str = "com.llmwiki.app";
 
@@ -69,19 +66,6 @@ pub fn run_headless_server() -> i32 {
         std::sync::Arc::new(crate::agent::cancel::AgentCancellationRegistry::default()),
         runtime.handle().clone(),
     );
-
-    let clip_enabled = std::env::var("LLM_WIKI_CLIP_SERVER")
-        .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
-        .unwrap_or(true);
-    if clip_enabled {
-        clip_server::start_clip_server(host.clone());
-        eprintln!(
-            "[llm-server] clip server: http://{} (for the browser extension)",
-            server_bind::bind_addr(&bind_host, server_bind::configured_clip_port())
-        );
-    } else {
-        eprintln!("[llm-server] clip server: disabled via LLM_WIKI_CLIP_SERVER");
-    }
 
     api_server::start_api_server(host);
     eprintln!(
@@ -176,7 +160,7 @@ fn ensure_registered_project() -> Result<(), String> {
         let _ = std::fs::create_dir_all(root.join("raw").join("sources"));
         eprintln!("[llm-server] scaffolded new project at {}", root.display());
     }
-    clip_server::set_current_project_path(&path);
+    project_registry::set_current_project_path(&path);
     eprintln!("[llm-server] project: {path} (exposed as \"current\")");
     Ok(())
 }

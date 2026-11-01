@@ -7,9 +7,7 @@ const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 const PUBLIC_BIND_HOST: &str = "0.0.0.0";
 const BIND_HOST_ENV: &str = "LLM_WIKI_BIND_HOST";
 const API_PORT_ENV: &str = "LLM_WIKI_BIND_PORT";
-const CLIP_PORT_ENV: &str = "LLM_WIKI_CLIP_PORT";
 pub const DEFAULT_API_PORT: u16 = 19828;
-pub const DEFAULT_CLIP_PORT: u16 = 19827;
 
 /// Resolve the host the HTTP servers should bind to:
 /// `LLM_WIKI_BIND_HOST` env wins, then the `allowLanAccess` flag in
@@ -23,11 +21,6 @@ pub fn configured_bind_host(store_path: Option<&Path>) -> String {
 /// API server port: `LLM_WIKI_BIND_PORT` env override, then 19828.
 pub fn configured_api_port() -> u16 {
     configured_env_port(API_PORT_ENV).unwrap_or(DEFAULT_API_PORT)
-}
-
-/// Clip server port: `LLM_WIKI_CLIP_PORT` env override, then 19827.
-pub fn configured_clip_port() -> u16 {
-    configured_env_port(CLIP_PORT_ENV).unwrap_or(DEFAULT_CLIP_PORT)
 }
 
 fn configured_env_bind_host() -> Option<String> {

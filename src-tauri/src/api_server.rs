@@ -18,7 +18,7 @@ use walkdir::WalkDir;
 
 use crate::cors::{local_cors_headers, request_origin};
 use crate::server_host::ServerHost;
-use crate::{agent, clip_server, commands, server_bind};
+use crate::{agent, commands, project_registry, server_bind};
 
 const API_PREFIX: &str = "/api/v1";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -782,7 +782,7 @@ fn handle_projects(app: &ServerHost) -> ApiResponse {
 }
 
 fn load_projects(app: &ServerHost) -> Vec<ProjectEntry> {
-    let current = normalize_path(&clip_server::current_project_path());
+    let current = normalize_path(&project_registry::current_project_path());
     let mut by_path: BTreeMap<String, ProjectEntry> = BTreeMap::new();
 
     if let Some(parsed) = load_app_state(app) {
@@ -834,7 +834,7 @@ fn load_projects(app: &ServerHost) -> Vec<ProjectEntry> {
         }
     }
 
-    for (name, path) in clip_server::all_projects() {
+    for (name, path) in project_registry::all_projects() {
         let path = normalize_path(&path);
         by_path.entry(path.clone()).or_insert_with(|| ProjectEntry {
             id: read_project_id(&path).unwrap_or_else(|| path.clone()),
@@ -4244,7 +4244,7 @@ mod tests {
             runtime.handle().clone(),
         );
         // Register the temp project so resolve_project can find it by path.
-        clip_server::set_current_project_path(&root_str);
+        project_registry::set_current_project_path(&root_str);
 
         let listed = handle_list_chat_sessions(&host, "current");
         assert_eq!(listed.status, 200);

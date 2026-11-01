@@ -21,8 +21,6 @@
 # Options (used by start/restart/build):
 #   -BindHost <ip>        LLM_WIKI_BIND_HOST   (default 127.0.0.1)
 #   -BindPort <port>      LLM_WIKI_BIND_PORT   (default 19828)
-#   -ClipPort <port>      LLM_WIKI_CLIP_PORT   (default 19827)
-#   -ClipServer <0|1>     LLM_WIKI_CLIP_SERVER (default 1)
 #   -DataDir <path>       LLM_WIKI_DATA_DIR    (default: share with the desktop app)
 #   -ProjectPath <path>   LLM_WIKI_PROJECT_PATH (exposed as "current"; scaffolded if missing)
 #   -Token <token>        LLM_WIKI_API_TOKEN
@@ -45,8 +43,6 @@ param(
     [string]$Command = "start",
     [string]$BindHost = "",
     [int]$BindPort = 0,
-    [int]$ClipPort = 0,
-    [string]$ClipServer = "",
     [string]$DataDir = "",
     [string]$ProjectPath = "",
     [string]$Token = "",
@@ -84,8 +80,6 @@ $DefaultConfigPath = Join-Path $PSScriptRoot "llm-server.config.json"
 $Settings = @{
     BindHost   = "127.0.0.1"
     BindPort   = 19828
-    ClipPort   = 19827
-    ClipServer = "1"
     DataDir    = ""
     ProjectPath = ""
     Token      = ""
@@ -94,8 +88,8 @@ $Settings = @{
     McpHost    = "127.0.0.1"
     McpPort    = 8931
 }
-$StringKeys = @("BindHost", "ClipServer", "DataDir", "ProjectPath", "Token", "ProtocPath", "McpHttp", "McpHost")
-$IntKeys = @("BindPort", "ClipPort", "McpPort")
+$StringKeys = @("BindHost", "DataDir", "ProjectPath", "Token", "ProtocPath", "McpHttp", "McpHost")
+$IntKeys = @("BindPort", "McpPort")
 
 function Merge-Settings {
     param($Source)
@@ -194,7 +188,6 @@ function Invoke-Health {
 
 function Format-SettingsLine {
     $parts = @("bind=$($Settings.BindHost):$($Settings.BindPort)")
-    if ($Settings.ClipServer -eq "1") { $parts += "clip=$($Settings.ClipPort)" }
     if ($Settings.DataDir -ne "") { $parts += "data=$($Settings.DataDir)" }
     if ($Settings.ProjectPath -ne "") { $parts += "project=$($Settings.ProjectPath)" }
     $parts += if ($Settings.Token -ne "") { "token=<set>" } else { "token=<none>" }
@@ -216,8 +209,6 @@ function Start-ServerProcess {
     $envVars = [ordered]@{}
     $envVars["LLM_WIKI_BIND_HOST"] = $Settings.BindHost
     $envVars["LLM_WIKI_BIND_PORT"] = "$($Settings.BindPort)"
-    $envVars["LLM_WIKI_CLIP_PORT"] = "$($Settings.ClipPort)"
-    if ($Settings.ClipServer -eq "0") { $envVars["LLM_WIKI_CLIP_SERVER"] = "0" }
     if ($Settings.DataDir -ne "") { $envVars["LLM_WIKI_DATA_DIR"] = $Settings.DataDir }
     if ($Settings.ProjectPath -ne "") { $envVars["LLM_WIKI_PROJECT_PATH"] = $Settings.ProjectPath }
     if ($Settings.Token -ne "") { $envVars["LLM_WIKI_API_TOKEN"] = $Settings.Token }
@@ -254,9 +245,6 @@ function Start-ServerProcess {
     Write-Host "llm-server started (pid $($proc.Id))" -ForegroundColor Green
     Write-Host "  $(Format-SettingsLine)"
     Write-Host "  API:   $(Get-HealthBaseUrl)/api/v1"
-    if ($Settings.ClipServer -eq "1") {
-        Write-Host "  Clip:  http://$($Settings.BindHost):$($Settings.ClipPort)"
-    }
     Write-Host "  Logs:  $ErrLog"
     $health = Invoke-Health
     if ($health) {

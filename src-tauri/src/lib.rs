@@ -8,7 +8,7 @@
 
 mod agent;
 mod api_server;
-mod clip_server;
+mod project_registry;
 mod commands;
 mod cors;
 pub mod headless;
