@@ -1,11 +1,14 @@
 # LLM Wiki
 
 > **⚠️ Project direction (2026-11-01): this is now a pure backend.**
-> The Tauri desktop app and its web frontend have been removed. What ships is
-> `llm-server` — a headless personal knowledge base service with a local
-> HTTP API (`/api/v1`, SSE streaming) and a Streamable-HTTP MCP server for
-> agents (Claude Code, Codex, …). Human-readable wiki browsing is provided by
-> opening the project folder in Obsidian (the wiki is plain Markdown).
+> The Tauri desktop app, its web frontend, and the MCP server have been
+> removed. What ships is `llm-server` — a headless personal knowledge base
+> service whose entire surface is a token-authenticated HTTP API (`/api/v1`,
+> SSE streaming for agent chat), fully described by the served OpenAPI 3.1
+> document at `GET /openapi.json`. Point any agent at it and drive everything
+> — browse/search/chat/write/history — straight over HTTP. Human-readable
+> wiki browsing is provided by opening the project folder in Obsidian (the
+> wiki is plain Markdown).
 > Run it with `scripts/llm-server.ps1` (Windows) or
 > `cargo run --bin llm-server` (any platform).
 > The sections below describe the original desktop-era design and are kept
