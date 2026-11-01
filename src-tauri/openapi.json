@@ -935,6 +935,38 @@
           }
         }
       }
+    },
+    "/api/v1/projects/current": {
+      "post": {
+        "summary": "Re-pin which project 'current' refers to",
+        "description": "Replaces the per-session project pinning of the removed MCP set_project tool. The path must be an existing directory; the project is registered for this server session and becomes the target of project_id=current.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "path"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{ ok, current }"
+          },
+          "404": {
+            "description": "Directory not found"
+          }
+        }
+      }
     }
   }
 }

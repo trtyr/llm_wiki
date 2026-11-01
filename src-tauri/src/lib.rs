@@ -8,6 +8,8 @@
 
 mod agent;
 mod api_docs;
+mod api_graph;
+mod api_sse;
 mod api_server;
 mod project_registry;
 mod commands;

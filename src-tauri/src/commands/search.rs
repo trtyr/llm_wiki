@@ -1111,7 +1111,7 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
 }
 
-pub fn extract_title(content: &str, file_name: &str) -> String {
+pub(crate) fn extract_title(content: &str, file_name: &str) -> String {
     let has_frontmatter = content.starts_with("---");
     let mut in_frontmatter = has_frontmatter;
     let mut frontmatter_closed = false;
@@ -1746,7 +1746,7 @@ fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
-fn relative_to_project(project_path: &str, path: &Path) -> String {
+pub(crate) fn relative_to_project(project_path: &str, path: &Path) -> String {
     let root = Path::new(project_path);
     path.strip_prefix(root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))

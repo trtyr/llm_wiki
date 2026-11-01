@@ -13,6 +13,7 @@ pub mod provider;
 pub mod router;
 pub mod runtime;
 pub mod session;
+pub mod shell_policy;
 pub mod skills;
 pub mod tools;
 pub mod types;

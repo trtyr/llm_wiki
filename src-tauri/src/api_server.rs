@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{Cursor, Read};
+
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,8 +14,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 use uuid::Uuid;
-use walkdir::WalkDir;
 
+
+use crate::api_graph::{invalidate_graph_cache, load_graph, select_graph_page};
+use crate::api_sse::{send_terminal_sse, sse_frame, try_send_sse, SseReader, SseSendResult};
+#[cfg(test)]
+use crate::api_graph::{build_graph, graph_aliases, resolve_link, ApiGraphEdge, ApiGraphNode};
+#[cfg(test)]
+use std::sync::Arc;
 use crate::cors::{local_cors_headers, request_origin};
 use crate::server_host::ServerHost;
 use crate::{agent, commands, project_registry, server_bind};
@@ -42,8 +48,6 @@ const MAX_IN_FLIGHT_CHAT_STREAMS: usize = 8;
 const MAX_IN_FLIGHT_PAGE_EMBEDS: usize = 4;
 const SSE_QUEUE_CAPACITY: usize = 64;
 const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const GRAPH_CACHE_TTL: Duration = Duration::from_secs(5);
-const GRAPH_CACHE_MAX_PROJECTS: usize = 8;
 
 /// API status: 0=starting, 1=running, 2=port_conflict, 3=error
 static API_STATUS: AtomicU8 = AtomicU8::new(0);
@@ -52,7 +56,6 @@ static IN_FLIGHT_CHAT_STREAMS: AtomicUsize = AtomicUsize::new(0);
 static IN_FLIGHT_PAGE_EMBEDS: AtomicUsize = AtomicUsize::new(0);
 static APP_STATE_CACHE: OnceLock<Mutex<Option<CachedAppState>>> = OnceLock::new();
 static RATE_LIMIT: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
-static GRAPH_CACHE: OnceLock<Mutex<HashMap<String, Arc<CachedGraph>>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct CachedAppState {
@@ -60,13 +63,6 @@ struct CachedAppState {
     value: Option<Value>,
 }
 
-#[derive(Clone)]
-struct CachedGraph {
-    loaded_at: Instant,
-    fingerprint: u64,
-    nodes: Vec<ApiGraphNode>,
-    edges: Vec<ApiGraphEdge>,
-}
 
 pub fn get_api_status() -> &'static str {
     match API_STATUS.load(Ordering::Relaxed) {
@@ -640,13 +636,19 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
 }
 
 fn percent_decode(input: &str) -> String {
+    // Byte-wise: slicing the &str at i+1..i+3 could land mid-character and
+    // panic for non-ASCII input. Hex decoding works on bytes; anything that
+    // is not a valid escape passes through, and invalid UTF-8 output becomes
+    // replacement characters instead of panicking.
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                out.push(v);
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
                 i += 3;
                 continue;
             }
@@ -1055,7 +1057,6 @@ fn handle_files(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse 
                 "projectId": project.id,
                 "root": "all",
                 "files": files,
-                "truncated": false,
             })),
             Err(e) => err(if e.contains("exceeds") { 413 } else { 500 }, e),
         };
@@ -1681,7 +1682,7 @@ fn handle_reviews(app: &ServerHost, project_id: &str, query: &str) -> ApiRespons
             "count": reviews.len(),
             "reviews": reviews,
         })),
-        Err(e) => err(500, e),
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 
@@ -1730,7 +1731,7 @@ fn handle_patch_review(
             "resolved": resolved,
         })),
         Ok(false) => err(404, format!("Review item '{review_id}' not found")),
-        Err(e) => err(500, e),
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 
@@ -1757,7 +1758,7 @@ fn handle_delete_review(app: &ServerHost, project_id: &str, review_id: &str) -> 
             "deleted": true,
         })),
         Ok(false) => err(404, format!("Review item '{review_id}' not found")),
-        Err(e) => err(500, e),
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 
@@ -1804,7 +1805,7 @@ fn handle_bulk_resolve_reviews(app: &ServerHost, project_id: &str, body: &str) -
             "notFound": not_found,
             "count": resolved.len(),
         })),
-        Err(e) => err(500, e),
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 
@@ -2108,7 +2109,7 @@ fn handle_search(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse 
             "graphHits": search.graph_hits,
             "results": search.results,
         })),
-        Err(e) => err(500, e),
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 
@@ -2201,17 +2202,17 @@ fn persist_chat_response(
     app: &ServerHost,
     prepared: &PreparedChat,
     response: &agent::types::AgentChatResponse,
-) {
-    if prepared.persist_session {
-        app.sessions()
-            .append_turn(
-                &prepared.project.path,
-                &prepared.project.id,
-                &response.session_id,
-                &prepared.user_message,
-                &response.message,
-            );
+) -> bool {
+    if !prepared.persist_session {
+        return true; // nothing requested, nothing to fail
     }
+    app.sessions().append_turn(
+        &prepared.project.path,
+        &prepared.project.id,
+        &response.session_id,
+        &prepared.user_message,
+        &response.message,
+    )
 }
 
 fn external_chat_response(mut response: agent::types::AgentChatResponse) -> Value {
@@ -2247,73 +2248,15 @@ fn handle_chat(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse {
         .finish(&prepared.project.id, &prepared.session_id, &prepared.run_id);
     match result {
         Ok(response) => {
-            persist_chat_response(app, &prepared, &response);
-            ok(external_chat_response(response))
+            let persisted = persist_chat_response(app, &prepared, &response);
+            let mut body = external_chat_response(response);
+            body["persisted"] = json!(persisted);
+            ok(body)
         }
         Err(e) if e == "message is required" => err(400, e),
         Err(e) if e == "Agent turn cancelled" => err(499, e),
         Err(e) => err(502, e),
     }
-}
-
-struct SseReader {
-    receiver: Receiver<Vec<u8>>,
-    current: Cursor<Vec<u8>>,
-}
-
-impl SseReader {
-    fn new(receiver: Receiver<Vec<u8>>) -> Self {
-        Self {
-            receiver,
-            current: Cursor::new(Vec::new()),
-        }
-    }
-}
-
-impl Read for SseReader {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            let read = self.current.read(buffer)?;
-            if read > 0 {
-                return Ok(read);
-            }
-            match self.receiver.recv() {
-                Ok(chunk) => self.current = Cursor::new(chunk),
-                Err(_) => return Ok(0),
-            }
-        }
-    }
-}
-
-fn sse_frame(event: &str, data: &Value) -> Vec<u8> {
-    format!("event: {event}\ndata: {}\n\n", data).into_bytes()
-}
-
-enum SseSendResult {
-    Sent,
-    Full,
-    Disconnected,
-}
-
-fn try_send_sse(sender: &SyncSender<Vec<u8>>, frame: Vec<u8>) -> SseSendResult {
-    match sender.try_send(frame) {
-        Ok(()) => SseSendResult::Sent,
-        Err(mpsc::TrySendError::Full(_)) => SseSendResult::Full,
-        Err(mpsc::TrySendError::Disconnected(_)) => SseSendResult::Disconnected,
-    }
-}
-
-fn send_terminal_sse(sender: SyncSender<Vec<u8>>, frame: Vec<u8>) {
-    // A terminal frame must not be dropped when the bounded queue is briefly
-    // full, but blocking a Tokio worker would stall unrelated app work. Use a
-    // short-lived writer thread; send unblocks when the socket drains or the
-    // request reader is dropped after a disconnect.
-    thread::spawn(move || {
-        let _ = sender.send(frame);
-    });
 }
 
 fn respond_chat_sse(
@@ -2410,7 +2353,12 @@ fn respond_chat_sse(
             .finish(&prepared.project.id, &prepared.session_id, &prepared.run_id);
         match result {
             Ok(Ok(response)) => {
-                persist_chat_response(&task_app, &prepared, &response);
+                if !persist_chat_response(&task_app, &prepared, &response) {
+                    eprintln!(
+                        "[api] chat session {} failed to persist (disk?)",
+                        response.session_id
+                    );
+                }
                 send_terminal_sse(
                     sender.clone(),
                     sse_frame("done", &external_chat_response(response)),
@@ -2646,31 +2594,6 @@ fn load_agent_runtime_config(app: &ServerHost, project_id: Option<&str>) -> Agen
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiGraphNode {
-    id: String,
-    label: String,
-    node_type: String,
-    path: String,
-    link_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiGraphEdge {
-    source: String,
-    target: String,
-    weight: f64,
-}
-
-struct GraphPage {
-    nodes: Vec<ApiGraphNode>,
-    edges: Vec<ApiGraphEdge>,
-    total_count: usize,
-    has_more: bool,
-}
-
 fn handle_graph(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse {
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
@@ -2721,353 +2644,7 @@ fn handle_graph(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse 
                 "hasMore": page.has_more,
             }))
         }
-        Err(e) => err(500, e),
-    }
-}
-
-fn select_graph_page(
-    nodes: &[ApiGraphNode],
-    edges: &[ApiGraphEdge],
-    q: Option<&str>,
-    node_type: Option<&str>,
-    offset: usize,
-    limit: usize,
-    paged_edges: bool,
-) -> GraphPage {
-    let matches = |node: &&ApiGraphNode| {
-        q.is_none_or(|q| {
-            node.id.to_lowercase().contains(q) || node.label.to_lowercase().contains(q)
-        }) && node_type.is_none_or(|node_type| node.node_type == node_type)
-    };
-    let total_count = nodes.iter().filter(matches).count();
-    let filtered_ids = paged_edges.then(|| {
-        nodes
-            .iter()
-            .filter(matches)
-            .map(|node| node.id.clone())
-            .collect::<BTreeSet<_>>()
-    });
-    let nodes: Vec<ApiGraphNode> = nodes
-        .iter()
-        .filter(matches)
-        .skip(offset)
-        .take(limit)
-        .cloned()
-        .collect();
-    let page_ids: BTreeSet<String> = nodes.iter().map(|node| node.id.clone()).collect();
-    let edges = edges
-        .iter()
-        .filter(|edge| {
-            if paged_edges {
-                page_ids.contains(&edge.source)
-                    && filtered_ids
-                        .as_ref()
-                        .is_some_and(|ids| ids.contains(&edge.target))
-            } else {
-                page_ids.contains(&edge.source) && page_ids.contains(&edge.target)
-            }
-        })
-        .cloned()
-        .collect();
-    let has_more = offset.saturating_add(nodes.len()) < total_count;
-    GraphPage {
-        nodes,
-        edges,
-        total_count,
-        has_more,
-    }
-}
-
-fn load_graph(project_path: &str) -> Result<Arc<CachedGraph>, String> {
-    let cache = GRAPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let cached = cache.lock().ok().and_then(|cache| {
-        cache
-            .get(project_path)
-            .filter(|entry| entry.loaded_at.elapsed() < GRAPH_CACHE_TTL)
-            .cloned()
-    });
-    if let Some(entry) = cached {
-        return Ok(entry);
-    }
-
-    let (fingerprint, files) = graph_files(project_path)?;
-    let cached = cache.lock().ok().and_then(|cache| {
-        cache
-            .get(project_path)
-            .filter(|entry| entry.fingerprint == fingerprint)
-            .cloned()
-    });
-    if let Some(entry) = cached {
-        return Ok(entry);
-    }
-
-    let (nodes, edges) = build_graph_from_files(project_path, &files)?;
-    let graph = Arc::new(CachedGraph {
-        loaded_at: Instant::now(),
-        fingerprint,
-        nodes,
-        edges,
-    });
-    if let Ok(mut cache) = cache.lock() {
-        cache.retain(|_, entry| entry.loaded_at.elapsed() < GRAPH_CACHE_TTL);
-        if cache.len() >= GRAPH_CACHE_MAX_PROJECTS && !cache.contains_key(project_path) {
-            if let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.loaded_at)
-                .map(|(path, _)| path.clone())
-            {
-                cache.remove(&oldest);
-            }
-        }
-        cache.insert(project_path.to_string(), Arc::clone(&graph));
-    }
-    Ok(graph)
-}
-
-fn graph_files(project_path: &str) -> Result<(u64, Vec<PathBuf>), String> {
-    let wiki_root = Path::new(project_path).join("wiki");
-    let mut files = Vec::new();
-    for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
-        if entry.file_type().is_file()
-            && entry
-                .path()
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.eq_ignore_ascii_case("md"))
-        {
-            files.push(entry.into_path());
-        }
-    }
-    files.sort();
-
-    let mut hasher = DefaultHasher::new();
-    for path in &files {
-        path.hash(&mut hasher);
-        if let Ok(metadata) = fs::metadata(path) {
-            metadata.len().hash(&mut hasher);
-            metadata.modified().ok().hash(&mut hasher);
-        }
-    }
-    Ok((hasher.finish(), files))
-}
-
-#[cfg(test)]
-fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
-    let (_, files) = graph_files(project_path)?;
-    build_graph_from_files(project_path, &files)
-}
-
-fn build_graph_from_files(
-    project_path: &str,
-    files: &[PathBuf],
-) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
-    let wiki_root = Path::new(project_path).join("wiki");
-    let mut stem_counts = HashMap::new();
-    for path in files {
-        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
-            *stem_counts.entry(stem.to_string()).or_insert(0usize) += 1;
-        }
-    }
-    let mut raw: BTreeMap<String, (String, String, String, Vec<String>)> = BTreeMap::new();
-    for path in files {
-        let content = match fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        let relative_id = wiki_page_id(&wiki_root, path);
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("");
-        let id = if stem_counts.get(stem) == Some(&1) {
-            stem.to_string()
-        } else {
-            relative_id
-        };
-        if id.is_empty() {
-            continue;
-        }
-        let fallback_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("");
-        let title = commands::search::extract_title(&content, fallback_name);
-        let node_type = extract_type(&content);
-        let relative_path = relative_to_project(project_path, path);
-        let links = commands::search::extract_graph_links(&content);
-        raw.insert(id, (title, node_type, relative_path, links));
-    }
-    // Query pages are intermediate artifacts rather than graph nodes. Remove
-    // them before link resolution so the API cannot emit edges whose source
-    // or target is absent from the returned node set.
-    raw.retain(|_, (_, node_type, _, _)| node_type != "query");
-    let aliases = graph_aliases(&raw);
-    let mut link_count: BTreeMap<String, usize> = raw.keys().map(|id| (id.clone(), 0)).collect();
-    let mut seen = BTreeSet::new();
-    let mut edges = Vec::new();
-    for (source, (_, _, _, links)) in &raw {
-        for link in links {
-            let Some(target) = resolve_link(link, &aliases) else {
-                continue;
-            };
-            if &target == source {
-                continue;
-            }
-            let key = if source < &target {
-                format!("{source}::{target}")
-            } else {
-                format!("{target}::{source}")
-            };
-            if seen.insert(key) {
-                *link_count.entry(source.clone()).or_default() += 1;
-                *link_count.entry(target.clone()).or_default() += 1;
-                edges.push(ApiGraphEdge {
-                    source: source.clone(),
-                    target,
-                    weight: 1.0,
-                });
-            }
-        }
-    }
-    let nodes = raw
-        .into_iter()
-        .map(|(id, (label, node_type, path, _))| ApiGraphNode {
-            link_count: *link_count.get(&id).unwrap_or(&0),
-            id,
-            label,
-            node_type,
-            path,
-        })
-        .collect();
-    Ok((nodes, edges))
-}
-
-fn wiki_page_id(wiki_root: &Path, path: &Path) -> String {
-    path.strip_prefix(wiki_root)
-        .unwrap_or(path)
-        .with_extension("")
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-struct GraphAliases {
-    exact_ids: HashMap<String, String>,
-    ids: HashMap<String, Option<String>>,
-    stems: HashMap<String, Option<String>>,
-    titles: HashMap<String, Option<String>>,
-}
-
-fn graph_aliases(raw: &BTreeMap<String, (String, String, String, Vec<String>)>) -> GraphAliases {
-    let mut aliases = GraphAliases {
-        exact_ids: HashMap::new(),
-        ids: HashMap::new(),
-        stems: HashMap::new(),
-        titles: HashMap::new(),
-    };
-    for (id, (title, _, path, _)) in raw {
-        aliases.exact_ids.insert(id.clone(), id.clone());
-        insert_graph_alias(&mut aliases.ids, name_alias_keys(id), id);
-        let canonical_path = path
-            .strip_prefix("wiki/")
-            .unwrap_or(path)
-            .trim_end_matches(".md");
-        insert_graph_alias(&mut aliases.ids, name_alias_keys(canonical_path), id);
-        if let Some(stem) = id.rsplit('/').next() {
-            insert_graph_alias(&mut aliases.stems, name_alias_keys(stem), id);
-        }
-        insert_graph_alias(&mut aliases.titles, name_alias_keys(title), id);
-    }
-    aliases
-}
-
-fn insert_graph_alias(aliases: &mut HashMap<String, Option<String>>, keys: Vec<String>, id: &str) {
-    for key in keys {
-        match aliases.get(&key) {
-            None => {
-                aliases.insert(key, Some(id.to_string()));
-            }
-            Some(Some(existing)) if existing != id => {
-                aliases.insert(key, None);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn link_alias_keys(raw: &str) -> Vec<String> {
-    let target = raw
-        .split('|')
-        .next()
-        .unwrap_or("")
-        .split('#')
-        .next()
-        .unwrap_or("")
-        .trim();
-    name_alias_keys(target)
-}
-
-fn name_alias_keys(raw: &str) -> Vec<String> {
-    let normalized = raw.trim().replace('\\', "/").to_lowercase();
-    let normalized = normalized.trim_matches('/');
-    let normalized = normalized.strip_prefix("./").unwrap_or(normalized);
-    let normalized = normalized.strip_prefix("wiki/").unwrap_or(normalized);
-    let normalized = if normalized.ends_with(".md") {
-        &normalized[..normalized.len() - 3]
-    } else {
-        normalized
-    };
-    if normalized.is_empty() {
-        return Vec::new();
-    }
-    let slugged = normalized.replace(' ', "-");
-    if slugged == normalized {
-        vec![normalized.to_string()]
-    } else {
-        vec![normalized.to_string(), slugged]
-    }
-}
-
-fn extract_type(content: &str) -> String {
-    for line in content.lines() {
-        if let Some(value) = line.trim().strip_prefix("type:") {
-            return value
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_lowercase();
-        }
-    }
-    "other".to_string()
-}
-
-fn resolve_link(raw: &str, aliases: &GraphAliases) -> Option<String> {
-    let exact = raw
-        .split('|')
-        .next()
-        .unwrap_or("")
-        .split('#')
-        .next()
-        .unwrap_or("")
-        .trim();
-    if let Some(id) = aliases.exact_ids.get(exact) {
-        return Some(id.clone());
-    }
-    let keys = link_alias_keys(raw);
-    for tier in [&aliases.ids, &aliases.stems, &aliases.titles] {
-        for key in &keys {
-            if let Some(resolved) = tier.get(key) {
-                return resolved.clone();
-            }
-        }
-    }
-    None
-}
-
-fn invalidate_graph_cache(project_path: &str) {
-    if let Some(cache) = GRAPH_CACHE.get() {
-        if let Ok(mut cache) = cache.lock() {
-            cache.remove(project_path);
-        }
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 
@@ -3085,7 +2662,7 @@ fn handle_rescan(app: &ServerHost, project_id: &str) -> ApiResponse {
         None,
     ) {
         Ok(result) => ok(json!({ "ok": true, "projectId": project.id, "result": result })),
-        Err(e) => err(500, e),
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 
@@ -3145,7 +2722,8 @@ fn handle_get_settings(app: &ServerHost) -> ApiResponse {
             }
             Err(e) => err(500, format!("app-state.json is not valid JSON: {e}")),
         },
-        Err(_) => ok(json!({})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ok(json!({})),
+        Err(e) => err(500, format!("failed to read app-state.json: {e}")),
     }
 }
 
@@ -3347,8 +2925,13 @@ fn handle_list_file_history(app: &ServerHost, project_id: &str, query: &str) -> 
     let Some(rel) = params.get("path") else {
         return err(400, "Missing path query parameter");
     };
-    let abs_path = std::path::Path::new(&project.path).join(rel);
-    let abs_path = abs_path.to_string_lossy().into_owned();
+    let abs_path = match safe_join(&project.path, rel) {
+        Ok(abs_path) => abs_path.to_string_lossy().into_owned(),
+        Err(e) => return err(400, e),
+    };
+    if !is_public_project_rel(rel) {
+        return err(403, "Path is not exposed by the local API");
+    }
     match app.block_on(commands::file_history::list_file_history(
         project.path.clone(),
         abs_path,
@@ -3379,8 +2962,13 @@ fn handle_restore_file_history(app: &ServerHost, project_id: &str, body: &str) -
         Ok(req) => req,
         Err(e) => return err(400, format!("Invalid JSON: {e}")),
     };
-    let abs_path = std::path::Path::new(&project.path).join(&req.path);
-    let abs_path = abs_path.to_string_lossy().into_owned();
+    if !is_public_project_rel(&req.path) {
+        return err(403, "Path is not exposed by the local API");
+    }
+    let abs_path = match safe_join(&project.path, &req.path) {
+        Ok(abs_path) => abs_path.to_string_lossy().into_owned(),
+        Err(e) => return err(400, e),
+    };
     match app.block_on(commands::file_history::restore_file_history(
         project.path.clone(),
         abs_path,
@@ -3410,7 +2998,7 @@ fn handle_file_history_stats(app: &ServerHost, project_id: &str) -> ApiResponse 
         project.path.clone(),
     )) {
         Ok(stats) => ok(json!({ "ok": true, "projectId": project.id, "stats": stats })),
-        Err(e) => err(500, e),
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 
@@ -3424,7 +3012,7 @@ fn handle_get_history_settings(app: &ServerHost, project_id: &str) -> ApiRespons
         project.path.clone(),
     )) {
         Ok(settings) => ok(json!({ "ok": true, "projectId": project.id, "settings": settings })),
-        Err(e) => err(500, e),
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 
@@ -3458,7 +3046,7 @@ fn handle_rebuild_index(app: &ServerHost, project_id: &str) -> ApiResponse {
         project.path.clone(),
     )) {
         Ok(result) => ok(json!({ "ok": true, "projectId": project.id, "result": result })),
-        Err(e) => err(500, e),
+        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
     }
 }
 

@@ -31,8 +31,15 @@ FAIL = 0
 FAILURES = []
 
 
+SKIP_LLM = False
+
+
 def check(name, ok, detail=""):
+    global SKIP_LLM
     global PASS, FAIL
+    if SKIP_LLM and ("blocking chat" in name or "SSE" in name or "cancel endpoint" in name or "long chat" in name):
+        print(f"  SKIP  {name} (--skip-llm)")
+        return
     if ok:
         PASS += 1
         print(f"  PASS  {name}")
@@ -75,7 +82,11 @@ def main():
     ap.add_argument("--base", default="http://127.0.0.1:19828")
     ap.add_argument("--token", required=True)
     ap.add_argument("--keep", action="store_true", help="keep the throwaway project dir")
+    ap.add_argument("--skip-llm", action="store_true", help="skip checks that call a real LLM (CI: no provider key)")
     args = ap.parse_args()
+    if args.skip_llm:
+        global SKIP_LLM
+        SKIP_LLM = True
 
     base = args.base.rstrip("/")
     if "://" in base:
@@ -96,7 +107,7 @@ def main():
     status, body, raw = c.request("GET", "/openapi.json", token="")
     check("openapi: served without auth", status == 200 and body.get("openapi", "").startswith("3.1"), str(body)[:80])
     spec_paths = set(body.get("paths", {}).keys())
-    check("openapi: 25 paths documented", len(spec_paths) == 25, f"got {len(spec_paths)}")
+    check("openapi: 26 paths documented", len(spec_paths) == 26, f"got {len(spec_paths)}")
     status, body, _ = c.request("GET", "/", token="")
     check("root / serves openapi", status == 200 and "openapi" in body, "")
     status, _, raw = c.request("GET", "/docs", token="")

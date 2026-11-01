@@ -36,6 +36,8 @@ pub struct AgentSessionStore {
 }
 
 impl AgentSessionStore {
+    /// Returns whether the turn was persisted to disk. Callers surface
+    /// failures instead of silently claiming a durable session.
     pub fn append_turn(
         &self,
         project_path: &str,
@@ -43,10 +45,10 @@ impl AgentSessionStore {
         session_id: &str,
         user: &str,
         assistant: &str,
-    ) {
+    ) -> bool {
         let now = now_ms();
         let Ok(mut guard) = self.inner.lock() else {
-            return;
+            return false;
         };
         let cache_key = session_cache_key(project_path, session_id);
         let session = guard
@@ -69,8 +71,9 @@ impl AgentSessionStore {
             session.messages.drain(0..drop_count);
         }
         session.updated_at = now;
-        let _ = save_session(project_path, session);
+        let saved = save_session(project_path, session).is_ok();
         trim_session_cache(&mut guard);
+        saved
     }
 
     pub fn recent_messages(
