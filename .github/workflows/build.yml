@@ -60,11 +60,6 @@ jobs:
         if: matrix.platform != 'windows-latest'
         run: shasum -a 256 -c src-tauri/pdfium/SHA256SUMS
 
-      # The repo ships pre-downloaded PDFium binaries under src-tauri/pdfium/
-      # for every supported architecture. For platforms whose bundled
-      # filename must stay `libpdfium.*`, swap the matching binary into
-      # place before cargo runs (no external download — the committed
-      # binaries are the maintenance-friendly path).
       - name: Use ARM64 pdfium binary (Ubuntu ARM only)
         if: matrix.platform == 'ubuntu-22.04-arm'
         run: |
@@ -84,7 +79,7 @@ jobs:
       - name: Package server artifact
         shell: bash
         run: |
-          VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*//')
+          VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | cut -d '"' -f 2)
           NAME="llm-wiki-server-${VERSION}-${{ matrix.platform }}"
           mkdir -p "dist-server/$NAME/pdfium"
           EXE="target/release/llm-server"
@@ -110,43 +105,3 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" --draft --title "LLM Wiki ${{ github.ref_name }}" --notes "Headless server release." 2>/dev/null || true
           gh release upload "${{ github.ref_name }}" dist-server/*.tar.gz --clobber
-
-  package-extension:
-    name: Package browser extension
-    needs: build
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Sync extension manifest version and zip
-        run: |
-          VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*//')
-          node -e "
-            const fs = require('fs');
-            const p = 'extension/manifest.json';
-            const m = JSON.parse(fs.readFileSync(p, 'utf-8'));
-            m.version = '${VERSION}';
-            fs.writeFileSync(p, JSON.stringify(m, null, 2) + '
-');
-          "
-          mkdir -p dist-extension
-          (cd extension && zip -r "../dist-extension/llm-wiki-extension-${VERSION}.zip" . -x "*.DS_Store")
-
-      - name: Attach extension zip to release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ github.ref_name }}" dist-extension/*.zip --clobber
-
-  publish-release:
-    name: Publish verified release
-    needs: [build, package-extension]
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Publish draft release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft=false

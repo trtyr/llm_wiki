@@ -23,14 +23,18 @@ pub fn is_allowed_browser_origin(origin: &str) -> bool {
 }
 
 pub fn local_cors_headers(origin: Option<&str>, allow_headers: &str) -> Vec<Header> {
+    // NOTE: no Content-Type here. tiny_http OVERWRITES duplicate headers,
+    // so a shared Content-Type here would clobber each response's own
+    // type (text/event-stream for SSE, text/html for /docs, application/json
+    // for the API). Callers set Content-Type when building the response.
+    // OPTIONS preflight coverage comes from the Allow-Headers line.
     let mut headers = vec![
         Header::from_bytes(
             "Access-Control-Allow-Methods",
-            "GET, POST, PATCH, DELETE, OPTIONS",
+            "GET, POST, PUT, PATCH, DELETE, OPTIONS",
         )
         .unwrap(),
         Header::from_bytes("Access-Control-Allow-Headers", allow_headers).unwrap(),
-        Header::from_bytes("Content-Type", "application/json").unwrap(),
     ];
     if let Some(origin) = origin.filter(|origin| is_allowed_browser_origin(origin)) {
         headers.push(Header::from_bytes("Access-Control-Allow-Origin", origin).unwrap());
@@ -93,7 +97,7 @@ mod tests {
         );
         assert_eq!(
             header_value(&allowed, "Access-Control-Allow-Methods").as_deref(),
-            Some("GET, POST, PATCH, DELETE, OPTIONS")
+            Some("GET, POST, PUT, PATCH, DELETE, OPTIONS")
         );
         assert_eq!(
             header_value(&allowed, "Access-Control-Allow-Headers").as_deref(),
