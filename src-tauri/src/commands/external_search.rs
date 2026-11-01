@@ -1,68 +1,9 @@
-use serde::{Deserialize, Serialize};
 
-use crate::agent::tools::{run_anytxt_search, run_web_search, AnyTxtConfig, WebSearchConfig};
-use crate::panic_guard::run_guarded_async;
 
 /// Frontend-facing search result shape. The Rust Agent uses
 /// `AgentReference` internally, but UI/deep-research code historically
 /// consumes `{ title, url, snippet, source }`; keep that wire contract
 /// stable while moving provider/network logic to Rust.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalSearchResult {
-    pub title: String,
-    pub url: String,
-    pub snippet: String,
-    pub source: String,
-}
-
-#[tauri::command]
-pub async fn web_search(
-    query: String,
-    config: WebSearchConfig,
-    max_results: Option<usize>,
-) -> Result<Vec<ExternalSearchResult>, String> {
-    run_guarded_async("web_search", async move {
-        let references = run_web_search(&query, Some(config), max_results.unwrap_or(10)).await?;
-        Ok(references
-            .into_iter()
-            .map(|item| ExternalSearchResult {
-                title: item.title,
-                source: hostname_label(&item.path).unwrap_or_else(|| "web".to_string()),
-                url: item.path,
-                snippet: item.snippet.unwrap_or_default(),
-            })
-            .collect())
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn anytxt_search(
-    query: String,
-    config: AnyTxtConfig,
-    max_results: Option<usize>,
-) -> Result<Vec<ExternalSearchResult>, String> {
-    run_guarded_async("anytxt_search", async move {
-        let references = run_anytxt_search(&query, Some(config), max_results.unwrap_or(20)).await?;
-        Ok(references
-            .into_iter()
-            .map(|item| ExternalSearchResult {
-                title: item.title,
-                url: file_url_for_path(&item.path),
-                snippet: item.snippet.unwrap_or_default(),
-                source: "AnyTXT".to_string(),
-            })
-            .collect())
-    })
-    .await
-}
-
-fn hostname_label(url: &str) -> Option<String> {
-    let host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
-    Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
-}
-
 pub(crate) fn file_url_for_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     if normalized.is_empty() || normalized.contains("://") {

@@ -104,7 +104,6 @@ pub struct SearchEmbeddingConfig {
     pub overlap_chunk_chars: Option<usize>,
 }
 
-#[tauri::command]
 pub async fn search_project(
     project_path: String,
     query: String,
@@ -128,7 +127,6 @@ pub async fn search_project(
     .await
 }
 
-#[tauri::command]
 pub async fn embedding_fetch(
     text: String,
     cfg: SearchEmbeddingConfig,
@@ -140,7 +138,6 @@ pub async fn embedding_fetch(
     .await
 }
 
-#[tauri::command]
 pub async fn embedding_fetch_batch(
     texts: Vec<String>,
     cfg: SearchEmbeddingConfig,
@@ -151,7 +148,6 @@ pub async fn embedding_fetch_batch(
     .await
 }
 
-#[tauri::command]
 pub async fn get_page_links(
     project_path: String,
     file_path: String,

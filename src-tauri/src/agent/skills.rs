@@ -17,20 +17,6 @@ pub struct AgentSkill {
     pub location: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AvailableAgentSkill {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub source: String,
-}
-
-#[tauri::command]
-pub fn agent_list_skills(project_path: String) -> Vec<AvailableAgentSkill> {
-    list_available_skills(&project_path)
-}
-
 pub fn load_project_skills(project_path: &str, requested: &[String]) -> Vec<AgentSkill> {
     if requested.is_empty() {
         return Vec::new();
@@ -45,54 +31,24 @@ pub fn load_project_skills(project_path: &str, requested: &[String]) -> Vec<Agen
         .collect()
 }
 
-fn list_available_skills(project_path: &str) -> Vec<AvailableAgentSkill> {
-    let mut skills = BTreeMap::<String, AvailableAgentSkill>::new();
-    for root in skill_roots(project_path) {
-        for candidate in discover_skill_candidates(&root.path) {
-            let Some(skill) = load_skill_path(&candidate.path, &candidate.id).ok() else {
-                continue;
-            };
-            // `id` is the path slug used for loading. `name` is display-only
-            // metadata from frontmatter and may contain spaces or punctuation.
-            // Roots are ordered from most specific to least specific. Keep the
-            // first occurrence so project-local skills can override user-level
-            // skills with the same id.
-            skills
-                .entry(candidate.id.clone())
-                .or_insert(AvailableAgentSkill {
-                    id: candidate.id,
-                    name: skill.name,
-                    description: skill.description,
-                    source: root.source.clone(),
-                });
-        }
-    }
-    skills.into_values().collect()
-}
-
 #[derive(Debug, Clone)]
 struct SkillRoot {
     path: PathBuf,
-    source: String,
 }
 
 fn skill_roots(project_path: &str) -> Vec<SkillRoot> {
     let mut roots = vec![SkillRoot {
         path: Path::new(project_path).join(".llm-wiki").join("skills"),
-        source: "project".to_string(),
     }];
     if let Some(home) = home_dir() {
         roots.push(SkillRoot {
             path: home.join(".claude").join("skills"),
-            source: "claude".to_string(),
         });
         roots.push(SkillRoot {
             path: home.join(".codex").join("skills"),
-            source: "codex".to_string(),
         });
         roots.push(SkillRoot {
             path: home.join(".agents").join("skills"),
-            source: "agents".to_string(),
         });
     }
     roots
@@ -463,161 +419,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn load_project_skills_rejects_symlink_skill_files() {
-        use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!("llm-wiki-skills-{}", Uuid::new_v4()));
-        let skills_dir = root.join(".llm-wiki").join("skills");
-        fs::create_dir_all(&skills_dir).unwrap();
-        let target = skills_dir.join("target.md");
-        fs::write(
-            &target,
-            "---\nname: target\ndescription: Target skill\n---\nDo not load through a symlink.",
-        )
-        .unwrap();
-        symlink(&target, skills_dir.join("evil.md")).unwrap();
 
-        let loaded = load_project_skills(root.to_str().unwrap(), &["evil".to_string()]);
-        assert!(loaded.is_empty());
-        let listed = list_available_skills(root.to_str().unwrap());
-        assert!(listed.iter().all(|skill| skill.id != "evil"));
-        let _ = fs::remove_dir_all(root);
-    }
 
-    #[test]
-    fn oversized_skill_files_are_ignored() {
-        let root = std::env::temp_dir().join(format!("llm-wiki-skills-{}", Uuid::new_v4()));
-        let skills_dir = root.join(".llm-wiki").join("skills");
-        fs::create_dir_all(&skills_dir).unwrap();
-        let body = "x".repeat(MAX_SKILL_FILE_BYTES + 1);
-        fs::write(
-            skills_dir.join("huge.md"),
-            format!("---\nname: huge\ndescription: Huge skill\n---\n{body}"),
-        )
-        .unwrap();
 
-        let listed = list_available_skills(root.to_str().unwrap());
-        assert!(listed.iter().all(|skill| skill.id != "huge"));
-        let loaded = load_project_skills(root.to_str().unwrap(), &["huge".to_string()]);
-        assert!(loaded.is_empty());
-        let _ = fs::remove_dir_all(root);
-    }
 
-    #[test]
-    fn list_available_skills_reads_markdown_and_skill_folders() {
-        let root = std::env::temp_dir().join(format!("llm-wiki-skills-{}", Uuid::new_v4()));
-        let skills_dir = root.join(".llm-wiki").join("skills");
-        fs::create_dir_all(skills_dir.join("illustrator")).unwrap();
-        fs::write(
-            skills_dir.join("reviewer.md"),
-            "---\nname: reviewer\ndescription: Review source quality\n---\nCheck claims.",
-        )
-        .unwrap();
-        fs::write(
-            skills_dir.join("illustrator").join("SKILL.md"),
-            "---\nname: illustrator\ndescription: Draw article images\n---\nCreate image prompts.",
-        )
-        .unwrap();
-
-        let skills = list_available_skills(root.to_str().unwrap());
-        let names = skills
-            .into_iter()
-            .map(|skill| (skill.id, skill.name, skill.source))
-            .collect::<Vec<_>>();
-        assert!(names.contains(&(
-            "reviewer".to_string(),
-            "reviewer".to_string(),
-            "project".to_string()
-        )));
-        assert!(names.contains(&(
-            "illustrator".to_string(),
-            "illustrator".to_string(),
-            "project".to_string()
-        )));
-        let loaded = load_project_skills(root.to_str().unwrap(), &["illustrator".to_string()]);
-        assert_eq!(loaded[0].name, "illustrator");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn list_available_skills_accepts_case_insensitive_markdown_names() {
-        let root = std::env::temp_dir().join(format!("llm-wiki-skills-{}", Uuid::new_v4()));
-        let skills_dir = root.join(".llm-wiki").join("skills");
-        fs::create_dir_all(skills_dir.join("designer")).unwrap();
-        fs::write(
-            skills_dir.join("Reviewer.MD"),
-            "---\nname: reviewer\ndescription: Review source quality\n---\nCheck claims.",
-        )
-        .unwrap();
-        fs::write(
-            skills_dir.join("designer").join("SKILL.MD"),
-            "---\nname: designer\ndescription: Design assets\n---\nCreate image prompts.",
-        )
-        .unwrap();
-
-        let skills = list_available_skills(root.to_str().unwrap());
-        let ids = skills
-            .into_iter()
-            .map(|skill| skill.id)
-            .collect::<BTreeSet<_>>();
-
-        assert!(ids.contains("Reviewer"));
-        assert!(ids.contains("designer"));
-        let loaded = load_project_skills(root.to_str().unwrap(), &["designer".to_string()]);
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded[0].location.ends_with("/designer/SKILL.MD"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn nested_skill_folder_is_listed_and_loadable() {
-        let root = std::env::temp_dir().join(format!("llm-wiki-skills-{}", Uuid::new_v4()));
-        let skill_dir = root
-            .join(".llm-wiki")
-            .join("skills")
-            .join("writing")
-            .join("article-illustrator");
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: Article Illustrator\ndescription: Draw article images\n---\nUse draw.sh after reading references.",
-        )
-        .unwrap();
-
-        let skills = list_available_skills(root.to_str().unwrap());
-        let article = skills
-            .iter()
-            .find(|skill| skill.id == "article-illustrator")
-            .expect("nested skill should be listed");
-        assert_eq!(article.name, "Article Illustrator");
-
-        let loaded = load_project_skills(root.to_str().unwrap(), &[article.id.clone()]);
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded[0]
-            .location
-            .ends_with("/writing/article-illustrator/SKILL.md"));
-        assert!(loaded[0].instructions.contains("Use draw.sh"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn skills_without_description_are_ignored() {
-        let root = std::env::temp_dir().join(format!("llm-wiki-skills-{}", Uuid::new_v4()));
-        let skills_dir = root.join(".llm-wiki").join("skills");
-        fs::create_dir_all(&skills_dir).unwrap();
-        fs::write(
-            skills_dir.join("anonymous.md"),
-            "---\nname: anonymous\n---\nDo something.",
-        )
-        .unwrap();
-
-        let listed = list_available_skills(root.to_str().unwrap());
-        assert!(listed.iter().all(|skill| skill.id != "anonymous"));
-        let loaded = load_project_skills(root.to_str().unwrap(), &["anonymous".to_string()]);
-        assert!(loaded.is_empty());
-        let _ = fs::remove_dir_all(root);
-    }
 
     #[test]
     fn load_project_skills_deduplicates_requested_ids() {
@@ -675,25 +481,4 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn list_available_skills_uses_slug_id_when_frontmatter_name_differs() {
-        let root = std::env::temp_dir().join(format!("llm-wiki-skills-{}", Uuid::new_v4()));
-        let skills_dir = root.join(".llm-wiki").join("skills");
-        fs::create_dir_all(&skills_dir).unwrap();
-        fs::write(
-            skills_dir.join("article.md"),
-            "---\nname: Article Illustrator\ndescription: Draw article images\n---\nCreate image prompts.",
-        )
-        .unwrap();
-
-        let skills = list_available_skills(root.to_str().unwrap());
-        let article = skills
-            .iter()
-            .find(|skill| skill.id == "article")
-            .expect("article skill should be listed");
-        assert_eq!(article.name, "Article Illustrator");
-        let loaded = load_project_skills(root.to_str().unwrap(), &[article.id.clone()]);
-        assert_eq!(loaded[0].name, "Article Illustrator");
-        let _ = fs::remove_dir_all(root);
-    }
 }

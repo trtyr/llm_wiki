@@ -1,26 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use md5::{Digest, Md5};
-use notify::event::{AccessKind, AccessMode, EventKind};
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
 use walkdir::WalkDir;
 
 use crate::panic_guard::run_guarded;
 
 const SNAPSHOT_FILE: &str = ".llm-wiki/file-snapshot.json";
 const QUEUE_FILE: &str = ".llm-wiki/file-change-queue.json";
-const EVENT_QUEUE_UPDATED: &str = "file-sync://queue-updated";
-const EVENT_CHANGED: &str = "file-sync://changed";
 const MAX_HASH_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RETRY_COUNT: u32 = 3;
 const APP_WRITE_IGNORE_MS: i64 = 4_000;
@@ -29,26 +20,11 @@ const QUEUE_EMIT_EVERY: usize = 25;
 // share reconnects, or long Windows sessions without terminating the watcher.
 // A low-frequency snapshot reconciliation makes the watcher self-healing on
 // every supported platform while keeping steady-state filesystem load small.
-const LINUX_WATCHER_RESCAN_INTERVAL_MS: i64 = 10_000;
-const OTHER_WATCHER_RESCAN_INTERVAL_MS: i64 = 60_000;
 const DEFAULT_SOURCE_WATCH_CONFIG_JSON: &str =
-    include_str!("../../../src/lib/source-watch-defaults.json");
+    include_str!("source-watch-defaults.json");
 
 static QUEUE_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static APP_WRITE_IGNORES: OnceLock<Mutex<BTreeMap<String, i64>>> = OnceLock::new();
-static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Default)]
-pub struct FileSyncState {
-    inner: Mutex<FileSyncInner>,
-}
-
-#[derive(Default)]
-struct FileSyncInner {
-    watcher: Option<RecommendedWatcher>,
-    project_id: Option<String>,
-    project_path: Option<PathBuf>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,177 +161,6 @@ fn normalize_source_watch_config(config: Option<SourceWatchConfig>) -> SourceWat
     config
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FileSyncPayload {
-    project_id: String,
-    tasks: Vec<FileChangeTask>,
-}
-
-#[tauri::command]
-pub fn start_project_file_watcher(
-    app: AppHandle,
-    state: State<FileSyncState>,
-    project_id: String,
-    project_path: String,
-    source_watch_config: Option<SourceWatchConfig>,
-) -> Result<FileChangeRescanResult, String> {
-    run_guarded("start_project_file_watcher", || {
-        let root = PathBuf::from(project_path);
-        let source_watch_config = normalize_source_watch_config(source_watch_config);
-        let watcher_generation = WATCHER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-        ensure_sync_dir(&root)?;
-        with_queue_lock(&root, || reset_processing_tasks(&root, &project_id))?;
-        enqueue_startup_rescan_changes(&root, &project_id, &source_watch_config)?;
-        let changed_tasks = process_queue(&app, &root, &project_id)?;
-
-        let (tx, rx) = mpsc::sync_channel::<PathBuf>(8_192);
-        let app_for_thread = app.clone();
-        let root_for_thread = root.clone();
-        let project_for_thread = project_id.clone();
-        let config_for_thread = source_watch_config.clone();
-        std::thread::spawn(move || {
-            let mut pending = BTreeSet::<PathBuf>::new();
-            let mut last_periodic_rescan = now_ms();
-            loop {
-                match rx.recv_timeout(Duration::from_millis(700)) {
-                    Ok(path) => {
-                        pending.insert(path);
-                        while let Ok(path) = rx.try_recv() {
-                            pending.insert(path);
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if pending.is_empty() {
-                            maybe_periodic_rescan(
-                                &app_for_thread,
-                                &root_for_thread,
-                                &project_for_thread,
-                                &config_for_thread,
-                                watcher_generation,
-                                &mut last_periodic_rescan,
-                            );
-                            continue;
-                        }
-                        let paths = pending.iter().cloned().collect::<Vec<_>>();
-                        pending.clear();
-                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            handle_changed_paths(
-                                &app_for_thread,
-                                &root_for_thread,
-                                &project_for_thread,
-                                &config_for_thread,
-                                watcher_generation,
-                                paths,
-                            )
-                        }));
-                        match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => eprintln!("[file-sync] change handling failed: {err}"),
-                            Err(_) => eprintln!("[file-sync] watcher worker recovered from panic"),
-                        }
-                        maybe_periodic_rescan(
-                            &app_for_thread,
-                            &root_for_thread,
-                            &project_for_thread,
-                            &config_for_thread,
-                            watcher_generation,
-                            &mut last_periodic_rescan,
-                        );
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-        });
-
-        let tx_for_watcher = tx.clone();
-        let root_for_overflow = root.clone();
-        let root_for_error = root.clone();
-        let mut watcher = RecommendedWatcher::new(
-            move |res: notify::Result<Event>| match res {
-                Ok(event) => {
-                    if !is_content_change_event(&event.kind) {
-                        return;
-                    }
-                    for path in event.paths {
-                        if tx_for_watcher.try_send(path).is_err() {
-                            let _ = tx_for_watcher.try_send(root_for_overflow.clone());
-                            break;
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("[file-sync] watcher error; scheduling rescan: {err}");
-                    let _ = tx_for_watcher.try_send(root_for_error.clone());
-                }
-            },
-            Config::default(),
-        )
-        .map_err(|e| format!("Failed to create file watcher: {e}"))?;
-        watcher
-            .watch(&root, RecursiveMode::Recursive)
-            .map_err(|e| format!("Failed to watch '{}': {e}", root.display()))?;
-        for rel in ["raw/sources", "wiki"] {
-            let path = root.join(rel);
-            if path.exists() {
-                if let Err(err) = watcher.watch(&path, RecursiveMode::Recursive) {
-                    eprintln!(
-                        "[file-sync] failed to add supplemental watch '{}': {err}",
-                        path.display()
-                    );
-                }
-            }
-        }
-
-        {
-            let mut inner = state.inner.lock().map_err(|_| "file sync state poisoned")?;
-            inner.watcher = Some(watcher);
-            inner.project_id = Some(project_id.clone());
-            inner.project_path = Some(root.clone());
-        }
-
-        let queue = with_queue_lock(&root, || read_queue(&root))?;
-        emit_queue(&app, &project_id, &queue);
-        Ok(FileChangeRescanResult {
-            queue,
-            changed_tasks,
-        })
-    })
-}
-
-#[tauri::command]
-pub fn stop_project_file_watcher(state: State<FileSyncState>) -> Result<(), String> {
-    run_guarded("stop_project_file_watcher", || {
-        WATCHER_GENERATION.fetch_add(1, Ordering::SeqCst);
-        let mut inner = state.inner.lock().map_err(|_| "file sync state poisoned")?;
-        inner.watcher = None;
-        inner.project_id = None;
-        inner.project_path = None;
-        Ok(())
-    })
-}
-
-#[tauri::command]
-pub fn rescan_project_files(
-    app: AppHandle,
-    project_id: String,
-    project_path: String,
-    source_watch_config: Option<SourceWatchConfig>,
-    watch_roots_only: Option<bool>,
-) -> Result<FileChangeRescanResult, String> {
-    rescan_core(
-        project_id.clone(),
-        project_path,
-        source_watch_config,
-        watch_roots_only,
-        Some(&|queue: &FileChangeQueue| emit_queue(&app, &project_id, queue)),
-        Some(&|tasks: Vec<FileChangeTask>| emit_changed_batch(&app, &project_id, tasks)),
-    )
-}
-
-/// Same rescan as the desktop command, but without frontend event
-/// emission — used by the API server, whose clients poll instead of
-/// listening to Tauri events.
 pub fn rescan_project_files_detached(
     project_id: String,
     project_path: String,
@@ -414,7 +219,6 @@ fn rescan_core(
     })
 }
 
-#[tauri::command]
 pub fn invalidate_project_file_snapshot_paths(
     project_path: String,
     paths: Vec<String>,
@@ -439,7 +243,6 @@ pub fn invalidate_project_file_snapshot_paths(
     })
 }
 
-#[tauri::command]
 pub fn get_file_change_queue(project_path: String) -> Result<FileChangeQueue, String> {
     run_guarded("get_file_change_queue", || {
         let root = PathBuf::from(project_path);
@@ -447,9 +250,7 @@ pub fn get_file_change_queue(project_path: String) -> Result<FileChangeQueue, St
     })
 }
 
-#[tauri::command]
 pub fn retry_file_change_task(
-    app: AppHandle,
     project_id: String,
     project_path: String,
     task_id: String,
@@ -470,16 +271,13 @@ pub fn retry_file_change_task(
             }
             write_queue(&root, &queue)
         })?;
-        process_queue(&app, &root, &project_id)?;
+        process_queue_inner(&root, &project_id, |_| {}, |_| {})?;
         let queue = with_queue_lock(&root, || read_queue(&root))?;
-        emit_queue(&app, &project_id, &queue);
         Ok(queue)
     })
 }
 
-#[tauri::command]
 pub fn ignore_file_change_task(
-    app: AppHandle,
     project_id: String,
     project_path: String,
     task_id: String,
@@ -494,7 +292,6 @@ pub fn ignore_file_change_task(
             write_queue(&root, &queue)?;
             read_queue(&root)
         })?;
-        emit_queue(&app, &project_id, &queue);
         Ok(queue)
     })
 }
@@ -508,178 +305,6 @@ pub fn mark_app_write_path(path: &Path) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     ignores.retain(|_, expires_at| *expires_at > now);
     ignores.insert(key, now + APP_WRITE_IGNORE_MS);
-}
-
-fn handle_changed_paths(
-    app: &AppHandle,
-    root: &Path,
-    project_id: &str,
-    source_watch_config: &SourceWatchConfig,
-    watcher_generation: u64,
-    paths: Vec<PathBuf>,
-) -> Result<(), String> {
-    if !is_active_watcher_generation(watcher_generation) {
-        return Ok(());
-    }
-    let rules = SourceWatchRules::new(source_watch_config);
-    let mut rels = BTreeSet::<String>::new();
-    let mut app_written_rels = BTreeSet::<String>::new();
-    let snapshot = with_queue_lock(root, || read_snapshot(root))?;
-    for path in paths {
-        if is_app_write_ignored(&path) {
-            collect_known_paths(root, &path, &snapshot, &mut app_written_rels, &rules);
-            continue;
-        }
-        if path.is_dir() {
-            for entry in WalkDir::new(&path).into_iter().filter_map(Result::ok) {
-                if entry.file_type().is_file() && !is_app_write_ignored(entry.path()) {
-                    if let Some(rel) = relative_watch_path(
-                        root,
-                        entry.path(),
-                        &rules,
-                        entry.metadata().ok().map(|m| m.len()),
-                    ) {
-                        rels.insert(rel);
-                    }
-                }
-            }
-        } else if let Some(rel) = relative_watch_path(root, &path, &rules, None) {
-            rels.insert(rel);
-        } else if !path.exists() {
-            collect_known_paths(root, &path, &snapshot, &mut rels, &rules);
-        }
-    }
-    if !app_written_rels.is_empty() {
-        sync_snapshot_paths(root, app_written_rels)?;
-    }
-    if rels.is_empty() {
-        return Ok(());
-    }
-    if !is_active_watcher_generation(watcher_generation) {
-        return Ok(());
-    }
-    enqueue_paths(root, project_id, rels)?;
-    if !is_active_watcher_generation(watcher_generation) {
-        return Ok(());
-    }
-    process_queue(app, root, project_id)?;
-    let queue = with_queue_lock(root, || read_queue(root))?;
-    if !is_active_watcher_generation(watcher_generation) {
-        return Ok(());
-    }
-    emit_queue(app, project_id, &queue);
-    Ok(())
-}
-
-fn maybe_periodic_rescan(
-    app: &AppHandle,
-    root: &Path,
-    project_id: &str,
-    source_watch_config: &SourceWatchConfig,
-    watcher_generation: u64,
-    last_periodic_rescan: &mut i64,
-) {
-    let interval = if cfg!(target_os = "linux") {
-        LINUX_WATCHER_RESCAN_INTERVAL_MS
-    } else {
-        OTHER_WATCHER_RESCAN_INTERVAL_MS
-    };
-    if now_ms() - *last_periodic_rescan < interval {
-        return;
-    }
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        rescan_watch_roots(
-            app,
-            root,
-            project_id,
-            source_watch_config,
-            watcher_generation,
-        )
-    }));
-    *last_periodic_rescan = now_ms();
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("[file-sync] periodic rescan failed: {err}"),
-        Err(_) => eprintln!("[file-sync] periodic rescan recovered from panic"),
-    }
-}
-
-fn rescan_watch_roots(
-    app: &AppHandle,
-    root: &Path,
-    project_id: &str,
-    source_watch_config: &SourceWatchConfig,
-    watcher_generation: u64,
-) -> Result<(), String> {
-    if !is_active_watcher_generation(watcher_generation) {
-        return Ok(());
-    }
-    // Linux retains the broader reconciliation because recursive inotify
-    // watches can miss subtree creation. Other platforms reconcile source
-    // inputs only to avoid a recurring generated-wiki scan.
-    let prefixes = if cfg!(target_os = "linux") {
-        &["raw/sources", "wiki", "purpose.md", "schema.md"][..]
-    } else {
-        &["raw/sources"][..]
-    };
-    enqueue_rescan_changes_for_prefixes(root, project_id, prefixes, source_watch_config)?;
-    if !is_active_watcher_generation(watcher_generation) {
-        return Ok(());
-    }
-    process_queue(app, root, project_id)?;
-    let queue = with_queue_lock(root, || read_queue(root))?;
-    if !is_active_watcher_generation(watcher_generation) {
-        return Ok(());
-    }
-    emit_queue(app, project_id, &queue);
-    Ok(())
-}
-
-fn is_active_watcher_generation(generation: u64) -> bool {
-    WATCHER_GENERATION.load(Ordering::SeqCst) == generation
-}
-
-fn collect_known_paths(
-    root: &Path,
-    path: &Path,
-    snapshot: &FileSnapshot,
-    rels: &mut BTreeSet<String>,
-    rules: &SourceWatchRules,
-) {
-    if path.is_dir() {
-        for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
-            if entry.file_type().is_file() {
-                if let Some(rel) = relative_watch_path(
-                    root,
-                    entry.path(),
-                    rules,
-                    entry.metadata().ok().map(|m| m.len()),
-                ) {
-                    rels.insert(rel);
-                }
-            }
-        }
-        return;
-    }
-
-    let Ok(rel_path) = path.strip_prefix(root) else {
-        return;
-    };
-    let Some(rel) = normalize_rel_path(rel_path) else {
-        return;
-    };
-    if !path.exists() {
-        for known in snapshot.files.keys() {
-            if known == &rel || known.starts_with(&format!("{rel}/")) {
-                rels.insert(known.clone());
-            }
-        }
-        return;
-    }
-
-    if should_watch_rel(&rel, rules) {
-        rels.insert(rel);
-    }
 }
 
 fn sync_snapshot_paths(root: &Path, rels: BTreeSet<String>) -> Result<(), String> {
@@ -915,19 +540,6 @@ fn upsert_task(
         error: None,
         needs_rerun: false,
     });
-}
-
-fn process_queue(
-    app: &AppHandle,
-    root: &Path,
-    project_id: &str,
-) -> Result<Vec<FileChangeTask>, String> {
-    process_queue_inner(
-        root,
-        project_id,
-        |queue| emit_queue(app, project_id, queue),
-        |tasks| emit_changed_batch(app, project_id, tasks),
-    )
 }
 
 fn process_queue_inner(
@@ -1334,25 +946,6 @@ fn merge_kind(existing: &FileChangeKind, incoming: &FileChangeKind) -> FileChang
     }
 }
 
-fn emit_queue(app: &AppHandle, project_id: &str, queue: &FileChangeQueue) {
-    let payload = FileSyncPayload {
-        project_id: project_id.to_string(),
-        tasks: queue.tasks.clone(),
-    };
-    let _ = app.emit(EVENT_QUEUE_UPDATED, payload);
-}
-
-fn emit_changed_batch(app: &AppHandle, project_id: &str, tasks: Vec<FileChangeTask>) {
-    if tasks.is_empty() {
-        return;
-    }
-    let payload = FileSyncPayload {
-        project_id: project_id.to_string(),
-        tasks,
-    };
-    let _ = app.emit(EVENT_CHANGED, payload);
-}
-
 fn ensure_sync_dir(root: &Path) -> Result<(), String> {
     fs::create_dir_all(root.join(".llm-wiki"))
         .map_err(|e| format!("Failed to create .llm-wiki: {e}"))
@@ -1499,22 +1092,6 @@ fn normalize_path_key(path: &Path) -> String {
     normalize_key(&path.to_string_lossy().replace('\\', "/"))
 }
 
-/// Whether a watcher event can mean the file *content* changed.
-///
-/// On Linux the inotify backend of `notify` also reports read-only activity
-/// (`IN_OPEN`, `IN_CLOSE_NOWRITE`, `IN_ACCESS`). Handling a change re-reads
-/// files (`md5_file`), which emits new read events, which schedule another pass:
-/// a self-sustaining loop that keeps a CPU core busy even when nothing on disk
-/// changes. Only a finished write (`IN_CLOSE_WRITE`) is an access-type event
-/// that matters; every non-access kind (create / modify / remove / rename / ...)
-/// is still forwarded.
-fn is_content_change_event(kind: &EventKind) -> bool {
-    match kind {
-        EventKind::Access(access) => matches!(access, AccessKind::Close(AccessMode::Write)),
-        _ => true,
-    }
-}
-
 fn is_app_write_ignored(path: &Path) -> bool {
     let key = path_key(path);
     let now = now_ms();
@@ -1531,45 +1108,6 @@ fn is_app_write_ignored(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
-
-    #[test]
-    fn read_only_access_events_do_not_count_as_content_changes() {
-        assert!(!is_content_change_event(&EventKind::Access(
-            AccessKind::Open(AccessMode::Any)
-        )));
-        assert!(!is_content_change_event(&EventKind::Access(
-            AccessKind::Open(AccessMode::Read)
-        )));
-        assert!(!is_content_change_event(&EventKind::Access(
-            AccessKind::Read
-        )));
-        assert!(!is_content_change_event(&EventKind::Access(
-            AccessKind::Close(AccessMode::Read)
-        )));
-        assert!(!is_content_change_event(&EventKind::Access(
-            AccessKind::Any
-        )));
-    }
-
-    #[test]
-    fn finished_writes_and_non_access_events_still_count() {
-        assert!(is_content_change_event(&EventKind::Access(
-            AccessKind::Close(AccessMode::Write)
-        )));
-        assert!(is_content_change_event(&EventKind::Create(
-            CreateKind::File
-        )));
-        assert!(is_content_change_event(&EventKind::Modify(ModifyKind::Any)));
-        assert!(is_content_change_event(&EventKind::Modify(
-            ModifyKind::Name(RenameMode::To)
-        )));
-        assert!(is_content_change_event(&EventKind::Remove(
-            RemoveKind::File
-        )));
-        assert!(is_content_change_event(&EventKind::Any));
-        assert!(is_content_change_event(&EventKind::Other));
-    }
 
     fn temp_root(name: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -1634,35 +1172,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn directory_delete_expands_snapshot_children() {
-        let root = temp_root("dir-delete");
-        let a = "raw/sources/folder/a.md";
-        let b = "raw/sources/folder/b.md";
-        fs::create_dir_all(root.join("raw/sources/folder")).unwrap();
-        fs::write(root.join(a), "a").unwrap();
-        fs::write(root.join(b), "b").unwrap();
-
-        ensure_sync_dir(&root).unwrap();
-        sync_snapshot_paths(&root, BTreeSet::from([a.to_string(), b.to_string()])).unwrap();
-        fs::remove_dir_all(root.join("raw/sources/folder")).unwrap();
-
-        let mut rels = BTreeSet::new();
-        let snapshot = read_snapshot(&root).unwrap();
-        let config = default_watch_config();
-        let rules = SourceWatchRules::new(&config);
-        collect_known_paths(
-            &root,
-            &root.join("raw/sources/folder"),
-            &snapshot,
-            &mut rels,
-            &rules,
-        );
-
-        assert_eq!(rels, BTreeSet::from([a.to_string(), b.to_string()]));
-
-        let _ = fs::remove_dir_all(root);
-    }
 
     #[test]
     fn prefix_rescan_detects_raw_source_mount_style_changes() {
@@ -1748,37 +1257,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn app_written_paths_update_snapshot_without_queueing() {
-        let root = temp_root("app-write");
-        let rel = "raw/sources/a.md";
-        let path = root.join(rel);
-        fs::write(&path, "old").unwrap();
-
-        ensure_sync_dir(&root).unwrap();
-        sync_snapshot_paths(&root, BTreeSet::from([rel.to_string()])).unwrap();
-        fs::write(&path, "new").unwrap();
-        mark_app_write_path(&path);
-
-        let mut app_written_rels = BTreeSet::new();
-        let snapshot = read_snapshot(&root).unwrap();
-        if is_app_write_ignored(&path) {
-            let config = default_watch_config();
-            let rules = SourceWatchRules::new(&config);
-            collect_known_paths(&root, &path, &snapshot, &mut app_written_rels, &rules);
-        }
-        sync_snapshot_paths(&root, app_written_rels).unwrap();
-
-        let queue = read_queue(&root).unwrap();
-        let snapshot = read_snapshot(&root).unwrap();
-        assert!(queue.tasks.is_empty());
-        assert_eq!(
-            snapshot.files.get(rel).and_then(|m| m.hash.clone()),
-            read_meta(&root, rel).unwrap().and_then(|m| m.hash)
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
 
     #[test]
     fn retry_limit_keeps_failed_task_failed_on_new_changes() {

@@ -77,6 +77,9 @@ pub fn get_api_status() -> &'static str {
     }
 }
 
+/// Kept for the upcoming settings API (PUT /settings) — the app-state
+/// cache must be dropped when config changes arrive over HTTP.
+#[allow(dead_code)]
 pub fn invalidate_config_cache() {
     if let Some(lock) = APP_STATE_CACHE.get() {
         if let Ok(mut cache) = lock.lock() {
@@ -1948,7 +1951,7 @@ impl Drop for PageEmbedSlot {
 
 fn try_acquire_page_embed_slot() -> Option<PageEmbedSlot> {
     IN_FLIGHT_PAGE_EMBEDS
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             (current < MAX_IN_FLIGHT_PAGE_EMBEDS).then_some(current + 1)
         })
         .ok()

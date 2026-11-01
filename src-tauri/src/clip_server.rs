@@ -28,7 +28,9 @@ const fn next_restart_count(current: u32) -> Option<u32> {
     }
 }
 
-/// Get current daemon status as a string
+/// Get current daemon status as a string. Reserved for a future
+/// `/health`-style endpoint; the desktop status command is gone.
+#[allow(dead_code)]
 pub fn get_daemon_status() -> &'static str {
     match DAEMON_STATUS.load(Ordering::Relaxed) {
         0 => "starting",

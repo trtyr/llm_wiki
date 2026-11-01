@@ -2,13 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use chrono::Local;
-use tauri::AppHandle;
-use tauri_plugin_opener::OpenerExt;
 
 use crate::panic_guard::run_guarded;
 use crate::types::wiki::WikiProject;
 
-#[tauri::command]
 pub fn create_project(name: String, path: String) -> Result<WikiProject, String> {
     run_guarded("create_project", || create_project_impl(name, path))
 }
@@ -241,7 +238,6 @@ related: []
     })
 }
 
-#[tauri::command]
 pub fn open_project(path: String) -> Result<WikiProject, String> {
     run_guarded("open_project", || {
         let root = Path::new(&path);
@@ -260,82 +256,6 @@ pub fn open_project(path: String) -> Result<WikiProject, String> {
             // Forward slashes for cross-platform consistency in the TS layer.
             path: path.replace('\\', "/"),
         })
-    })
-}
-
-#[tauri::command]
-pub fn open_project_folder(app: AppHandle, path: String) -> Result<(), String> {
-    run_guarded("open_project_folder", || {
-        let root = Path::new(&path);
-        validate_wiki_project_root(root)?;
-
-        let canonical = root
-            .canonicalize()
-            .map_err(|e| format!("Failed to resolve project path '{}': {}", path, e))?;
-        let canonical = canonical.to_string_lossy().to_string();
-
-        match app.opener().open_path(canonical.clone(), None::<&str>) {
-            Ok(()) => Ok(()),
-            Err(open_err) => app
-                .opener()
-                .reveal_item_in_dir(canonical)
-                .map_err(|reveal_err| {
-                    format!(
-                        "Failed to open project folder: {}; reveal fallback also failed: {}",
-                        open_err, reveal_err
-                    )
-                }),
-        }
-    })
-}
-
-#[tauri::command]
-pub fn open_path_in_project(
-    app: AppHandle,
-    project_path: String,
-    target_path: String,
-) -> Result<(), String> {
-    run_guarded("open_path_in_project", || {
-        let root = Path::new(&project_path);
-        validate_wiki_project_root(root)?;
-
-        let root_canonical = root
-            .canonicalize()
-            .map_err(|e| format!("Failed to resolve project path '{}': {}", project_path, e))?;
-        let target = Path::new(&target_path);
-        let target = if target.is_absolute() {
-            target.to_path_buf()
-        } else {
-            root_canonical.join(target)
-        };
-        let target_canonical = target.canonicalize().map_err(|e| {
-            format!(
-                "Failed to resolve target path '{}': {}",
-                target.display(),
-                e
-            )
-        })?;
-
-        if !target_canonical.starts_with(&root_canonical) {
-            return Err(format!(
-                "Refusing to open a path outside the project: '{}'",
-                target_canonical.display()
-            ));
-        }
-
-        let target = target_canonical.to_string_lossy().to_string();
-        match app.opener().open_path(target.clone(), None::<&str>) {
-            Ok(()) => Ok(()),
-            Err(open_err) => app
-                .opener()
-                .reveal_item_in_dir(target)
-                .map_err(|reveal_err| {
-                    format!(
-                        "Failed to open project path: {}; reveal fallback also failed: {}",
-                        open_err, reveal_err
-                    )
-                }),
-        }
     })
 }
 

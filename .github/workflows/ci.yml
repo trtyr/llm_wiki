@@ -26,37 +26,31 @@ jobs:
         if: matrix.platform == 'macos-latest'
         run: brew install protobuf
 
-      - name: Install dependencies (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
+      - name: Install protoc (Linux/Windows)
+        if: matrix.platform != 'macos-latest'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf protobuf-compiler
-
-      - name: Install protoc (Windows)
-        if: matrix.platform == 'windows-latest'
-        run: choco install protoc -y
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          else
+            choco install protoc -y
+          fi
+        shell: bash
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install frontend dependencies
-        run: npm install
-
-      - name: Check frontend build
-        run: npx vite build
-
-      - name: Prepare MCP server resources
-        run: |
-          npm --prefix mcp-server ci
-          npm run mcp:build
-
       - name: Check Rust build
         working-directory: src-tauri
         run: cargo build
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: Build and test MCP server
+        run: |
+          npm --prefix mcp-server ci
+          npm --prefix mcp-server run build
+          npm --prefix mcp-server test

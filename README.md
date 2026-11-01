@@ -1,5 +1,17 @@
 # LLM Wiki
 
+> **⚠️ Project direction (2026-11-01): this is now a pure backend.**
+> The Tauri desktop app and its web frontend have been removed. What ships is
+> `llm-server` — a headless personal knowledge base service with a local
+> HTTP API (`/api/v1`, SSE streaming) and a Streamable-HTTP MCP server for
+> agents (Claude Code, Codex, …). Human-readable wiki browsing is provided by
+> opening the project folder in Obsidian (the wiki is plain Markdown).
+> Run it with `scripts/llm-server.ps1` (Windows) or
+> `cargo run --bin llm-server` (any platform).
+> The sections below describe the original desktop-era design and are kept
+> for historical reference.
+
+
 <p align="center">
   <img src="logo.jpg" width="128" height="128" style="border-radius: 22%;" alt="LLM Wiki Logo">
 </p>

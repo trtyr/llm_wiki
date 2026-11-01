@@ -1,5 +1,13 @@
 # LLM Wiki
 
+> **⚠️ 项目方向（2026-11-01）：本仓库已转变为纯后端。**
+> Tauri 桌面端与 Web 前端已移除。现交付物为 `llm-server`——无界面个人知识库服务：
+> 本地 HTTP API（`/api/v1`，SSE 流式）+ 面向 Agent 的 MCP 服务（Claude Code、Codex 等）。
+> 人类浏览 Wiki 请直接用 Obsidian 打开项目目录（Wiki 就是纯 Markdown）。
+> Windows 用 `scripts/llm-server.ps1` 启动；其他平台 `cargo run --bin llm-server`。
+> 以下内容为桌面版时期的原始设计说明，仅作历史参考。
+
+
 <p align="center">
   <img src="logo.jpg" width="128" height="128" style="border-radius: 22%;" alt="LLM Wiki Logo">
 </p>
