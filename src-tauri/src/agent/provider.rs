@@ -378,9 +378,31 @@ impl LlmClient {
             .trim()
             .to_string();
         if content.is_empty() {
-            return Err("LLM response did not contain assistant content".to_string());
+            return Err(Self::upstream_error_message(&parsed));
         }
         Ok(content)
+    }
+
+    /// Surface provider-embedded errors (MiniMax `base_resp`, OpenAI
+    /// `error`) when a gateway answers HTTP 200 with no assistant content.
+    fn upstream_error_message(parsed: &Value) -> String {
+        if let Some(message) = parsed
+            .get("base_resp")
+            .and_then(|resp| resp.get("status_msg"))
+            .and_then(Value::as_str)
+            .filter(|m| !m.trim().is_empty())
+        {
+            return format!("LLM upstream error: {message}");
+        }
+        if let Some(message) = parsed
+            .get("error")
+            .and_then(|err| err.get("message"))
+            .and_then(Value::as_str)
+            .filter(|m| !m.trim().is_empty())
+        {
+            return format!("LLM upstream error: {message}");
+        }
+        "LLM response did not contain assistant content".to_string()
     }
 
     async fn stream_openai_like<F>(

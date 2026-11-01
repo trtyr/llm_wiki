@@ -12,6 +12,9 @@
 #   status     Process state + HTTP health report
 #   health     One-shot HTTP /health query
 #   logs       Show recent server output (-Tail N, -Follow, -StdOut)
+#   start-mcp  Start the MCP HTTP bridge (remote MCP over Streamable HTTP)
+#   stop-mcp   Stop the MCP HTTP bridge
+#   restart-mcp  stop-mcp + start-mcp
 #   build      Build mcp-server + cargo build (checks protoc)
 #   help       This text
 #
@@ -26,6 +29,13 @@
 #   -Config <path>        JSON config file (default: scripts\llm-server.config.json)
 #   -Binary <path>        Explicit llm-server.exe path (default: newest build)
 #   -Release              build flag for the "build" command
+#
+# MCP bridge options (start-mcp/restart-mcp; also via config file):
+#   -McpHttp <0|1>        enable/disable the bridge (default 0)
+#   -McpHost <ip>         bind address for the bridge (default 127.0.0.1)
+#   -McpPort <port>       bridge port (default 8931)
+# The bridge exposes http://<McpHost>:<McpPort>/mcp (Streamable HTTP, Bearer
+# token auth reusing -Token) and forwards to the local API.
 #
 # Config file: copy scripts\llm-server.config.example.json to
 # scripts\llm-server.config.json and edit it. CLI options override the file.
@@ -42,6 +52,9 @@ param(
     [string]$Token = "",
     [string]$Config = "",
     [string]$Binary = "",
+    [string]$McpHttp = "",
+    [string]$McpHost = "",
+    [int]$McpPort = 0,
     [switch]$Release,
     [int]$Tail = 40,
     [switch]$Follow,
@@ -59,6 +72,9 @@ $RunDir = Join-Path $RepoRoot ".run"
 $PidFile = Join-Path $RunDir "llm-server.pid"
 $OutLog = Join-Path $RunDir "llm-server.out.log"
 $ErrLog = Join-Path $RunDir "llm-server.err.log"
+$McpPidFile = Join-Path $RunDir "mcp-http.pid"
+$McpOutLog = Join-Path $RunDir "mcp-http.out.log"
+$McpErrLog = Join-Path $RunDir "mcp-http.err.log"
 $DefaultConfigPath = Join-Path $PSScriptRoot "llm-server.config.json"
 
 # ---------------------------------------------------------------------------
@@ -74,9 +90,12 @@ $Settings = @{
     ProjectPath = ""
     Token      = ""
     ProtocPath = ""
+    McpHttp    = "0"
+    McpHost    = "127.0.0.1"
+    McpPort    = 8931
 }
-$StringKeys = @("BindHost", "ClipServer", "DataDir", "ProjectPath", "Token", "ProtocPath")
-$IntKeys = @("BindPort", "ClipPort")
+$StringKeys = @("BindHost", "ClipServer", "DataDir", "ProjectPath", "Token", "ProtocPath", "McpHttp", "McpHost")
+$IntKeys = @("BindPort", "ClipPort", "McpPort")
 
 function Merge-Settings {
     param($Source)
@@ -102,11 +121,11 @@ if (Test-Path $configPath) {
 }
 
 # status/health/stop/logs/restart describe an instance that may have been
-# started with different settings than today's defaults — prefer the
-# snapshot written when it was last started. Explicit CLI parameters still
-# win, so `restart -BindPort X` re-binds as requested.
+# started with different settings than today's defaults — prefer the snapshot
+# written when it was last started. Explicit CLI parameters still win, so
+# `restart -BindPort X` re-binds as requested.
 $RuntimePath = Join-Path $RunDir "llm-server.runtime.json"
-if ((Test-Path $RuntimePath) -and @("status", "health", "stop", "logs", "restart") -contains $Command.ToLower()) {
+if ((Test-Path $RuntimePath) -and @("status", "health", "stop", "logs", "restart", "start-mcp", "stop-mcp", "restart-mcp") -contains $Command.ToLower()) {
     Merge-Settings (Get-Content $RuntimePath -Raw | ConvertFrom-Json)
 }
 
@@ -290,6 +309,12 @@ function Show-Status {
     } else {
         Write-Host "  health: no response on $(Get-HealthBaseUrl)/health" -ForegroundColor Yellow
     }
+    $mcp = Get-McpProcess
+    if ($mcp) {
+        Write-Host "  mcp:    RUNNING (pid $($mcp.Id)) http://$($Settings.McpHost):$($Settings.McpPort)/mcp"
+    } elseif ($Settings.McpHttp -eq "1") {
+        Write-Host "  mcp:    STOPPED (start with 'start-mcp')" -ForegroundColor Yellow
+    }
 }
 
 function Show-Logs {
@@ -303,6 +328,87 @@ function Show-Logs {
     } else {
         Get-Content $target -Tail $Tail
     }
+}
+
+function Get-McpProcess {
+    # Pid-file only: the bridge is a generic node.exe, so a by-image-name
+    # fallback could match unrelated Node processes.
+    if (Test-Path $McpPidFile) {
+        $recordedPid = Get-Content $McpPidFile -TotalCount 1
+        if ("$recordedPid" -match "^\d+$") {
+            $proc = Get-Process -Id ([int]$recordedPid) -ErrorAction SilentlyContinue
+            if ($proc -and $proc.ProcessName -eq "node") { return $proc }
+        }
+        Remove-Item $McpPidFile -ErrorAction SilentlyContinue
+    }
+    return $null
+}
+
+function Start-McpBridge {
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        Write-Error "node not found on PATH (the bridge is a Node script)."
+    }
+    if (-not (Test-Path (Join-Path $RepoRoot "mcp-server\dist\src\http.js"))) {
+        Write-Error "mcp-server HTTP entry is not built. Run: scripts\llm-server.ps1 build"
+    }
+    $existing = Get-McpProcess
+    if ($existing) {
+        Write-Host "mcp-http bridge is already running (pid $($existing.Id))."
+        return
+    }
+    if (-not (Get-ServerProcess)) {
+        Write-Host "WARNING: llm-server is not running; the bridge will start but tools will fail until it is." -ForegroundColor Yellow
+    }
+    if (-not (Test-Path $RunDir)) { New-Item -ItemType Directory -Path $RunDir | Out-Null }
+
+    $envVars = [ordered]@{
+        LLM_WIKI_API_TOKEN  = $Settings.Token
+        LLM_WIKI_API_BASE_URL = "http://127.0.0.1:$($Settings.BindPort)"
+        MCP_HTTP_HOST       = $Settings.McpHost
+        MCP_HTTP_PORT       = "$($Settings.McpPort)"
+    }
+    $saved = @{}
+    foreach ($key in $envVars.Keys) {
+        $saved[$key] = [Environment]::GetEnvironmentVariable($key)
+        [Environment]::SetEnvironmentVariable($key, $envVars[$key], "Process")
+    }
+    try {
+        $proc = Start-Process -FilePath "node" `
+            -ArgumentList (Join-Path $RepoRoot "mcp-server\dist\src\http.js") `
+            -WorkingDirectory (Join-Path $RepoRoot "mcp-server") `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $McpOutLog `
+            -RedirectStandardError $McpErrLog `
+            -PassThru
+    } finally {
+        foreach ($key in $saved.Keys) {
+            [Environment]::SetEnvironmentVariable($key, $saved[$key], "Process")
+        }
+    }
+    Start-Sleep -Seconds 2
+    $proc.Refresh()
+    if ($proc.HasExited) {
+        Write-Host "mcp-http bridge exited immediately. Last log lines:" -ForegroundColor Red
+        Get-Content $McpErrLog -Tail 15 -ErrorAction SilentlyContinue | Write-Host
+        return
+    }
+    Set-Content -Path $McpPidFile -Value $proc.Id | Out-Null
+    Write-Host "mcp-http bridge started (pid $($proc.Id))" -ForegroundColor Green
+    Write-Host "  URL:   http://$($Settings.McpHost):$($Settings.McpPort)/mcp"
+    Write-Host "  Auth:  Authorization: Bearer <Token>"
+    Write-Host "  Logs:  $McpErrLog"
+}
+
+function Stop-McpBridge {
+    $proc = Get-McpProcess
+    if (-not $proc) {
+        Write-Host "mcp-http bridge is not running."
+        return
+    }
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Wait-Process -Id $proc.Id -Timeout 5 -ErrorAction SilentlyContinue
+    Remove-Item $McpPidFile -ErrorAction SilentlyContinue
+    Write-Host "mcp-http bridge (pid $($proc.Id)) stopped."
 }
 
 function Invoke-Build {
@@ -367,17 +473,20 @@ function Show-Help {
 # ---------------------------------------------------------------------------
 
 switch ($Command.ToLower()) {
-    "start"   { Start-ServerProcess }
-    "stop"    { Stop-ServerProcess }
-    "restart" { Stop-ServerProcess; Start-Sleep -Seconds 1; Start-ServerProcess }
-    "status"  { Show-Status }
-    "health"  {
+    "start"       { Start-ServerProcess }
+    "stop"        { Stop-ServerProcess }
+    "restart"     { Stop-ServerProcess; Start-Sleep -Seconds 1; Start-ServerProcess }
+    "status"      { Show-Status }
+    "health"      {
         $health = Invoke-Health
         if ($health) { $health | ConvertTo-Json -Depth 5 }
         else { Write-Host "no response from $(Get-HealthBaseUrl)/health" }
     }
-    "logs"    { Show-Logs }
-    "build"   { Invoke-Build }
-    "help"    { Show-Help }
-    default   { Write-Host "Unknown command: $Command"; Show-Help }
+    "logs"        { Show-Logs }
+    "start-mcp"   { Start-McpBridge }
+    "stop-mcp"    { Stop-McpBridge }
+    "restart-mcp" { Stop-McpBridge; Start-Sleep -Seconds 1; Start-McpBridge }
+    "build"       { Invoke-Build }
+    "help"        { Show-Help }
+    default       { Write-Host "Unknown command: $Command"; Show-Help }
 }

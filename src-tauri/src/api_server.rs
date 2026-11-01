@@ -362,6 +362,9 @@ fn handle_request(
         (&Method::Get, ["projects", project_id, "files", "content"]) => {
             handle_file_content(app, project_id, query)
         }
+        (&Method::Delete, ["projects", project_id, "files", "content"]) => {
+            handle_delete_file(app, project_id, query)
+        }
         (&Method::Get, ["projects", project_id, "reviews"]) => {
             handle_reviews(app, project_id, query)
         }
@@ -388,6 +391,12 @@ fn handle_request(
         (&Method::Post, ["projects", project_id, "chat"]) => handle_chat(app, project_id, body),
         (&Method::Post, ["projects", project_id, "chat", session_id, "cancel"]) => {
             handle_cancel_chat(app, project_id, session_id)
+        }
+        (&Method::Get, ["projects", project_id, "chat", "sessions"]) => {
+            handle_list_chat_sessions(app, project_id)
+        }
+        (&Method::Get, ["projects", project_id, "chat", "sessions", session_id]) => {
+            handle_get_chat_session(app, project_id, session_id, query)
         }
         _ => err(404, "Not found"),
     }
@@ -892,6 +901,59 @@ fn project_name_from_path(path: &str) -> String {
 
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+/// DELETE /api/v1/projects/{id}/files/content?path=<rel>
+///
+/// Deletes one file under the publicly exposed project paths (same guard as
+/// reads: `wiki/`, `raw/sources/`, purpose.md, schema.md; no dot-paths).
+/// A restorable version is recorded before removal (same file-history
+/// mechanism the write path uses), and wiki pages get their vector index
+/// entries dropped so hybrid search does not return ghosts.
+fn handle_delete_file(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let params = parse_query(query);
+    let Some(rel) = params.get("path") else {
+        return err(400, "Missing path query parameter");
+    };
+    if !is_public_project_rel(rel) {
+        return err(403, "Path is not exposed by the local API");
+    }
+    let path = match safe_join(&project.path, rel) {
+        Ok(path) => path,
+        Err(e) => return err(400, e),
+    };
+    if !path.is_file() {
+        return err(404, format!("File not found: {rel}"));
+    }
+    commands::file_history::record_file_version(&path, "api", "api.files.delete");
+    if let Err(e) = fs::remove_file(&path) {
+        return err(500, format!("Failed to delete file: {e}"));
+    }
+
+    let mut vectors_cleared = false;
+    let lower = normalize_path(rel).to_lowercase();
+    if lower.starts_with("wiki/") && lower.ends_with(".md") {
+        let page_id = lower[5..lower.len() - 3].to_string();
+        vectors_cleared = app
+            .block_on(commands::vectorstore::vector_delete_page(
+                project.path.clone(),
+                page_id,
+            ))
+            .is_ok();
+    }
+    invalidate_graph_cache(&project.path);
+
+    ok(json!({
+        "ok": true,
+        "projectId": project.id,
+        "deleted": normalize_path(rel),
+        "historyRecorded": true,
+        "vectorsCleared": vectors_cleared,
+    }))
 }
 
 fn handle_files(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse {
@@ -2336,6 +2398,59 @@ fn handle_cancel_chat(app: &ServerHost, project_id: &str, session_id: &str) -> A
             .cancellations()
             .cancel(&project.id, session_id, None),
         "sessionId": session_id,
+    }))
+}
+
+/// GET /api/v1/projects/{id}/chat/sessions
+///
+/// Lists the agent chat sessions persisted under the project, newest first
+/// (by `updatedAt`). Powers the web client's session switcher.
+fn handle_list_chat_sessions(app: &ServerHost, project_id: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let mut sessions = app.sessions().list_sessions(&project.path);
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    ok(json!({
+        "ok": true,
+        "projectId": project.id,
+        "sessions": sessions,
+    }))
+}
+
+/// GET /api/v1/projects/{id}/chat/sessions/{sessionId}?limit=N
+///
+/// Returns the last N (default 40, max 200) messages of one chat session,
+/// oldest first.
+fn handle_get_chat_session(
+    app: &ServerHost,
+    project_id: &str,
+    session_id: &str,
+    query: &str,
+) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let params = parse_query(query);
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(40)
+        .clamp(1, 200);
+    let session_id = percent_decode(session_id);
+    if session_id.trim().is_empty() {
+        return err(400, "sessionId is required");
+    }
+    let messages = app
+        .sessions()
+        .recent_messages(&project.path, &session_id, limit);
+    ok(json!({
+        "ok": true,
+        "projectId": project.id,
+        "sessionId": session_id,
+        "messages": messages,
     }))
 }
 
@@ -4094,5 +4209,52 @@ mod tests {
         assert_eq!(config.model, "live-model");
         assert_eq!(config.api_key, "live-secret");
         assert_eq!(config.custom_endpoint, "https://live.example/v1");
+    }
+
+    #[test]
+    fn chat_session_endpoints_list_and_fetch_messages() {
+        let root = test_project_dir();
+        let root_str = root.to_string_lossy().to_string();
+        let dir = root.join(".llm-wiki").join("agent-sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let session = agent::session::AgentSession {
+            session_id: "sess-1".to_string(),
+            project_id: "proj".to_string(),
+            messages: vec![
+                agent::session::AgentSessionMessage { role: "user".into(), content: "q1".into(), timestamp: 1 },
+                agent::session::AgentSessionMessage { role: "assistant".into(), content: "a1".into(), timestamp: 2 },
+                agent::session::AgentSessionMessage { role: "user".into(), content: "q2".into(), timestamp: 3 },
+            ],
+            updated_at: 42,
+        };
+        fs::write(
+            dir.join("sess-1.json"),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let host = ServerHost::new(
+            None,
+            Arc::new(agent::session::AgentSessionStore::default()),
+            Arc::new(agent::cancel::AgentCancellationRegistry::default()),
+            runtime.handle().clone(),
+        );
+        // Register the temp project so resolve_project can find it by path.
+        clip_server::set_current_project_path(&root_str);
+
+        let listed = handle_list_chat_sessions(&host, "current");
+        assert_eq!(listed.status, 200);
+        assert_eq!(listed.body["sessions"][0]["sessionId"], "sess-1");
+        assert_eq!(listed.body["sessions"][0]["updatedAt"], 42);
+
+        let fetched = handle_get_chat_session(&host, "current", "sess-1", "limit=2");
+        assert_eq!(fetched.status, 200);
+        let messages = fetched.body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+
+        let missing = handle_get_chat_session(&host, "current", "", "");
+        assert_eq!(missing.status, 400);
+        let _ = fs::remove_dir_all(root);
     }
 }

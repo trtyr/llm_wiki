@@ -240,6 +240,19 @@ export class LlmWikiApiClient {
     }
   }
 
+  async deleteFile(projectId = "current", path: string): Promise<{ deleted: string; historyRecorded: boolean; vectorsCleared: boolean }> {
+    const params = new URLSearchParams({ path })
+    const json = await this.request(
+      `/projects/${encodeURIComponent(projectId)}/files/content?${params.toString()}`,
+      { method: "DELETE" },
+    )
+    return {
+      deleted: typeof json.deleted === "string" ? json.deleted : path,
+      historyRecorded: json.historyRecorded === true,
+      vectorsCleared: json.vectorsCleared === true,
+    }
+  }
+
   async reviews(projectId = "current", options: { status?: ApiReviewStatus; type?: string; limit?: number } = {}): Promise<ApiReviewsResponse> {
     const params = new URLSearchParams()
     if (options.status) params.set("status", options.status)
@@ -383,7 +396,7 @@ export class LlmWikiApiClient {
     }
   }
 
-  private async request(path: string, options: { method?: "GET" | "POST"; body?: unknown; auth?: boolean } = {}): Promise<Record<string, unknown>> {
+  private async request(path: string, options: { method?: "GET" | "POST" | "DELETE"; body?: unknown; auth?: boolean } = {}): Promise<Record<string, unknown>> {
     const url = `${this.baseUrl}${apiPath(path)}`
     const headers: Record<string, string> = { Accept: "application/json" }
     if (options.auth !== false && this.token?.trim()) {

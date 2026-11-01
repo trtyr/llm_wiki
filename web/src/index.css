@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-neutral-50 text-neutral-900 antialiased;
+}
+
+/* Reading typography */
+.wiki-content {
+  @apply text-[16px] leading-[1.75] text-neutral-800;
+}
+.wiki-content h1 {
+  @apply mt-2 mb-6 text-[1.9em] font-bold tracking-tight text-neutral-900 border-b border-neutral-200 pb-3;
+}
+.wiki-content h2 {
+  @apply mt-10 mb-4 text-[1.4em] font-semibold text-neutral-900;
+}
+.wiki-content h3 {
+  @apply mt-8 mb-3 text-[1.15em] font-semibold text-neutral-900;
+}
+.wiki-content p {
+  @apply my-4;
+}
+.wiki-content ul {
+  @apply my-4 list-disc pl-6 space-y-1;
+}
+.wiki-content ol {
+  @apply my-4 list-decimal pl-6 space-y-1;
+}
+.wiki-content a {
+  @apply text-blue-700 underline decoration-blue-300 underline-offset-2 hover:decoration-blue-600;
+}
+.wiki-content a.wiki-link {
+  @apply text-indigo-700 no-underline border-b border-dashed border-indigo-300 hover:border-indigo-600;
+}
+.wiki-content a.wiki-link-unresolved {
+  @apply text-neutral-500 no-underline border-b border-dotted border-neutral-300 cursor-help;
+}
+.wiki-content blockquote {
+  @apply my-4 border-l-4 border-neutral-300 bg-neutral-100/60 pl-4 pr-3 py-2 text-neutral-700 rounded-r;
+}
+.wiki-content code {
+  @apply rounded bg-neutral-200/70 px-1.5 py-0.5 text-[0.875em] font-mono;
+}
+.wiki-content pre {
+  @apply my-5 overflow-x-auto rounded-lg bg-neutral-900 text-neutral-100 p-4 text-[13.5px] leading-relaxed;
+}
+.wiki-content pre code {
+  @apply bg-transparent text-neutral-100 p-0 text-[1em];
+}
+.wiki-content table {
+  @apply my-5 w-full border-collapse text-[15px];
+}
+.wiki-content th {
+  @apply border border-neutral-300 bg-neutral-100 px-3 py-2 text-left font-semibold;
+}
+.wiki-content td {
+  @apply border border-neutral-300 px-3 py-2 align-top;
+}
+.wiki-content hr {
+  @apply my-8 border-neutral-200;
+}
+.wiki-content img {
+  @apply my-4 max-w-full rounded-lg border border-neutral-200;
+}
+.mermaid-box {
+  @apply my-5 flex justify-center rounded-lg border border-neutral-200 bg-white p-4 overflow-x-auto;
+}
