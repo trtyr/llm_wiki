@@ -1094,17 +1094,7 @@ fn handle_write_page(app: &ServerHost, project_id: &str, body: &str) -> ApiRespo
             "result": result,
         })),
         Err(error) => {
-            let lower = error.to_ascii_lowercase();
-            let status = if lower.contains("without allowoverwrite") {
-                409
-            } else if lower.contains("path")
-                || lower.contains("markdown file")
-                || lower.contains("too large")
-            {
-                400
-            } else {
-                500
-            };
+            let status = agent::tools::page_write_error_status(&error);
             err(status, error)
         }
     }
@@ -1336,6 +1326,28 @@ fn external_chat_response(mut response: agent::types::AgentChatResponse) -> Valu
     })
 }
 
+/// Maps an agent-loop error string to an HTTP status: client-side request
+/// problems are 400, cancellations 499, upstream/provider failures 502.
+/// The agent runtime reports errors as free-form strings, so this is
+/// necessarily a heuristic — co-located here with the known producer
+/// messages from the runtime.
+fn chat_error_status(error: &str) -> u16 {
+    if error == "Agent turn cancelled" {
+        return 499;
+    }
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("requires query")
+        || lower.contains("requires path")
+        || lower.contains("requires an active skill")
+        || lower.contains("invalid")
+        || lower.contains("unsupported")
+        || lower.starts_with("unknown agent tool")
+    {
+        return 400;
+    }
+    502
+}
+
 fn handle_chat(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse {
     let mut prepared = match prepare_chat(app, project_id, body) {
         Ok(prepared) => prepared,
@@ -1354,9 +1366,7 @@ fn handle_chat(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse {
             body["persisted"] = json!(persisted);
             ok(body)
         }
-        Err(e) if e == "message is required" => err(400, e),
-        Err(e) if e == "Agent turn cancelled" => err(499, e),
-        Err(e) => err(502, e),
+        Err(e) => err(chat_error_status(&e), e),
     }
 }
 

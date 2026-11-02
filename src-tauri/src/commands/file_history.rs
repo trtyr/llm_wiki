@@ -380,8 +380,15 @@ pub async fn list_file_history(
         }
         checked_history_dir(&root, false)?;
         let store_path = checked_history_file(&root, &file)?;
-        let raw = fs::read_to_string(store_path).unwrap_or_else(|_| "[]".to_string());
-        let mut entries: Vec<FileHistoryEntry> = serde_json::from_str(&raw).unwrap_or_default();
+        // Missing store is a normal empty history; a corrupt one must be an
+        // error so clients don't mistake data loss for "no versions yet".
+        let raw = match fs::read_to_string(&store_path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "[]".to_string(),
+            Err(e) => return Err(format!("Failed to read history store: {e}")),
+        };
+        let mut entries: Vec<FileHistoryEntry> = serde_json::from_str(&raw)
+            .map_err(|err| format!("History store is corrupt: {err}"))?;
         entries.reverse();
         Ok(entries)
     })

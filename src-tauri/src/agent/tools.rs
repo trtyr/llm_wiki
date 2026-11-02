@@ -641,6 +641,22 @@ pub fn write_wiki_page_with_options(
     Ok(write_wiki_page_with_activity(project_path, rel_path, content, allow_overwrite)?.reference)
 }
 
+/// Classifies a page-write error string into the HTTP status the API
+/// should return. Deliberately co-located with the error producers in this
+/// module so wording changes here cannot silently break the mapping.
+pub fn page_write_error_status(error: &str) -> u16 {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("without allowoverwrite") {
+        409
+    } else if lower.contains("path") || lower.contains("markdown file") {
+        400
+    } else if lower.contains("too large") {
+        413
+    } else {
+        500
+    }
+}
+
 pub fn write_wiki_page_verified(
     project_path: &str,
     rel_path: &str,

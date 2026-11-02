@@ -163,7 +163,17 @@ fn now_ms() -> u64 {
 fn load_session(project_path: &str, session_id: &str) -> Option<AgentSession> {
     let path = session_file(project_path, session_id)?;
     let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    match serde_json::from_str(&raw) {
+        Ok(session) => Some(session),
+        Err(err) => {
+            // A corrupt session file must not silently look like a brand-new
+            // chat: surface it so the operator knows history was dropped.
+            eprintln!(
+                "[session] corrupt session file {session_id} in {project_path}: {err}"
+            );
+            None
+        }
+    }
 }
 
 fn save_session(project_path: &str, session: &AgentSession) -> Result<(), String> {
@@ -174,7 +184,15 @@ fn save_session(project_path: &str, session: &AgentSession) -> Result<(), String
     }
     let raw = serde_json::to_string_pretty(session)
         .map_err(|err| format!("Failed to serialize session: {err}"))?;
-    fs::write(path, raw).map_err(|err| format!("Failed to write session: {err}"))
+    // Atomic write-then-rename: a torn session file previously loaded as a
+    // silent empty session, wiping the user's chat history.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, raw).map_err(|err| format!("Failed to write session tmp: {err}"))?;
+    if let Err(err) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Failed to replace session file: {err}"));
+    }
+    Ok(())
 }
 
 fn session_file(project_path: &str, session_id: &str) -> Option<PathBuf> {

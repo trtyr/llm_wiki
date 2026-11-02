@@ -180,10 +180,19 @@ fn warn_if_exposed(bind_host: &str, store_path: &Path) {
     if loopback {
         return;
     }
+    let anonymous_ok = std::env::var("LLM_WIKI_ALLOW_UNAUTHENTICATED")
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE"))
+        .unwrap_or(false)
+        || store_flag(store_path, "apiConfig.allowUnauthenticated");
     let has_token = std::env::var("LLM_WIKI_API_TOKEN")
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
         || store_token(store_path).is_some();
+    if anonymous_ok {
+        eprintln!(
+            "[llm-server] WARNING: allowUnauthenticated is enabled — every endpoint on {bind_host} is open to the local network without a token"
+        );
+    }
     if !has_token {
         eprintln!(
             "[llm-server] WARNING: binding non-loopback host {bind_host:?} with no API token. \
@@ -191,6 +200,23 @@ Agent chat can invoke tools (including shell commands) on this machine. \
 Set LLM_WIKI_API_TOKEN or apiConfig.token in app-state.json before exposing the server."
         );
     }
+}
+
+fn store_flag(store_path: &Path, key_path: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(store_path) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let mut node = &parsed;
+    for part in key_path.split('.') {
+        match node.get(part) {
+            Some(next) => node = next,
+            None => return false,
+        }
+    }
+    node.as_bool() == Some(true)
 }
 
 fn store_token(store_path: &Path) -> Option<String> {
