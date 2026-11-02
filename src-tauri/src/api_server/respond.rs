@@ -28,6 +28,14 @@ pub(super) fn err(status: u16, message: impl Into<String>) -> ApiResponse {
     }
 }
 
+/// 500 responses log the internal detail server-side but return a generic
+/// message to the client, so filesystem paths and storage internals are not
+/// disclosed over the wire.
+pub(super) fn err_internal(label: &str, error: impl std::fmt::Display) -> ApiResponse {
+    eprintln!("[api] 500 {label}: {error}");
+    err(500, "Internal API server error")
+}
+
 pub(super) fn respond_error(request: tiny_http::Request, status: u16, message: &str, origin: Option<&str>) {
     respond_json(
         request,

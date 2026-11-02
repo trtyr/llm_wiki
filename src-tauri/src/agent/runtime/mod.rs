@@ -181,7 +181,7 @@ impl AgentRuntime {
         let router = route_query(message, request.mode, &request.tools);
         let skills = load_project_skills(&self.project_path, &request.skills);
         check_cancel(cancellation.as_ref())?;
-        if !request.skills.is_empty() {
+        if !skills.is_empty() {
             permission_policy.require(AgentCapability::ReadProject)?;
             let skill_detail = match request.skill_mode {
                 AgentSkillMode::Auto => format!("{} skill(s) available", skills.len()),

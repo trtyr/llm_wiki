@@ -24,6 +24,17 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
         })
         .collect();
 
+    let (path, query) = split_url(&url);
+
+    // Auth BEFORE body read: a 40 MB chat body read into memory before any
+    // authentication would give an unauthenticated LAN peer a ~2.5 GB
+    // memory-amplification lever (64 in-flight slots x MAX_CHAT_BODY_BYTES).
+    // Token and headers are all we need to reject here.
+    if is_token_required_request(&method, &path) && !is_token_authorized(&app, query, &headers) {
+        respond_error(request, 401, "Unauthorized", origin.as_deref());
+        return;
+    }
+
     let body = match read_body(&mut request, body_limit_for_request(&method, &url)) {
         Ok(body) => body,
         Err(err) => {
@@ -32,7 +43,6 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
         }
     };
 
-    let (path, query) = split_url(&url);
     // Access log: mutating requests are always logged so deletes, config
     // writes and history restores can be reconstructed from the console.
     if matches!(
@@ -52,6 +62,7 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
             return;
         }
         if !is_authorized(&app, query, &headers) {
+            eprintln!("[api] 401 unauthorized {} {}", method, url);
             respond_error(
                 request,
                 401,

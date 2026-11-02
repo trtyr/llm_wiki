@@ -45,10 +45,9 @@ use reviews::{
 };
 mod respond;
 
-use respond::{allow_request, ok, err, respond_error, respond_json, respond_options,
+use respond::{allow_request, err, err_internal, ok, respond_error, respond_json, respond_options,
               should_rate_limit, ApiResponse};
 use router::{cors_headers, process_request};
-#[cfg(test)]
 #[cfg(test)]
 use auth::constant_time_eq;
 #[cfg(test)]
@@ -562,6 +561,10 @@ fn handle_search(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse 
     }
     let top_k = req.top_k.unwrap_or(10).clamp(1, MAX_SEARCH_RESULTS);
     let query = req.query;
+    // Embedding is optional by design: if resolution fails (provider
+    // misconfig, upstream outage) degrade to keyword-only search instead
+    // of failing the whole request — the failure is server-side, not the
+    // client's fault.
     let query_embedding =
         match app.block_on(commands::search::resolve_query_embedding(
             &query,
@@ -569,7 +572,12 @@ fn handle_search(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse 
             load_embedding_config(app),
         )) {
             Ok(embedding) => embedding,
-            Err(e) => return err(400, e),
+            Err(e) => {
+                eprintln!(
+                    "[api] query embedding unavailable, falling back to keyword-only: {e}"
+                );
+                None
+            }
         };
     match app.block_on(commands::search::search_project_inner(
         project.path.clone(),
@@ -588,7 +596,7 @@ fn handle_search(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse 
             "graphHits": search.graph_hits,
             "results": search.results,
         })),
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => err_internal("handler error", e),
     }
 }
 
@@ -1143,7 +1151,7 @@ fn handle_graph(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse 
                 "hasMore": page.has_more,
             }))
         }
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => err_internal("handler error", e),
     }
 }
 
@@ -1161,7 +1169,7 @@ fn handle_rescan(app: &ServerHost, project_id: &str) -> ApiResponse {
         None,
     ) {
         Ok(result) => ok(json!({ "ok": true, "projectId": project.id, "result": result })),
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => err_internal("handler error", e),
     }
 }
 
@@ -1279,7 +1287,10 @@ fn handle_put_settings(app: &ServerHost, body: &str) -> ApiResponse {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
-            return err(500, format!("app-state.json is unreadable ({}); refusing to overwrite", e))
+            return err_internal(
+                "settings PUT: app-state.json unreadable, refusing overwrite",
+                e,
+            )
         }
     };
     let mut merged: Value = if existing_raw.trim().is_empty() {
@@ -1288,8 +1299,10 @@ fn handle_put_settings(app: &ServerHost, body: &str) -> ApiResponse {
         match serde_json::from_str::<Value>(&existing_raw) {
             Ok(v) if v.is_object() => v,
             _ => {
-                return err(500,
-                    "app-state.json is corrupt or not a JSON object; refusing to overwrite — fix or move the file first")
+                return err_internal(
+                    "settings PUT: app-state.json corrupt, refusing overwrite",
+                    "app-state.json is corrupt or not a JSON object; refusing to overwrite (see server log)",
+                )
             }
         }
     };
@@ -1459,11 +1472,28 @@ fn handle_set_current_project(app: &ServerHost, body: &str) -> ApiResponse {
     let display_name = std::path::Path::new(&req.path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("Project");
-    project_registry::register_project(display_name, &req.path);
+        .unwrap_or("Project")
+        .to_string();
+    project_registry::register_project(&display_name, &req.path);
     project_registry::set_current_project_path(&req.path);
-    let project_id = read_project_id(&req.path).unwrap_or_else(|| req.path.clone());
-    persist_project_registration(app, &project_id, display_name, &req.path);
+    // Give dirs without an identity file one (same as projects/create), so
+    // the project is addressable by a stable UUID instead of its path.
+    let project_id = match read_project_id(&req.path) {
+        Some(id) => id,
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let meta_dir = std::path::Path::new(&req.path).join(".llm-wiki");
+            if fs::create_dir_all(&meta_dir).is_ok() {
+                let payload = json!({ "id": id, "name": display_name });
+                let _ = fs::write(
+                    meta_dir.join("project.json"),
+                    serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                );
+            }
+            id
+        }
+    };
+    persist_project_registration(app, &project_id, &display_name, &req.path);
     invalidate_config_cache();
     ok(json!({ "ok": true, "current": req.path.replace('\\', "/") }))
 }
@@ -1552,7 +1582,7 @@ fn handle_file_history_stats(app: &ServerHost, project_id: &str) -> ApiResponse 
         project.path.clone(),
     )) {
         Ok(stats) => ok(json!({ "ok": true, "projectId": project.id, "stats": stats })),
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => err_internal("handler error", e),
     }
 }
 
@@ -1566,7 +1596,7 @@ fn handle_get_history_settings(app: &ServerHost, project_id: &str) -> ApiRespons
         project.path.clone(),
     )) {
         Ok(settings) => ok(json!({ "ok": true, "projectId": project.id, "settings": settings })),
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => err_internal("handler error", e),
     }
 }
 
@@ -1600,7 +1630,7 @@ fn handle_rebuild_index(app: &ServerHost, project_id: &str) -> ApiResponse {
         project.path.clone(),
     )) {
         Ok(result) => ok(json!({ "ok": true, "projectId": project.id, "result": result })),
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => err_internal("handler error", e),
     }
 }
 
