@@ -249,6 +249,7 @@ def main():
     c.request("POST", f"{P}/pages/write", body={"path": seed_page, "content": f"# Seed\n\nunique marker {token_phrase} for search verification."})
     status, search, _ = c.request("POST", f"{P}/search", body={"query": token_phrase, "topK": 5, "includeContent": True})
     check("keyword search finds seeded page", status == 200 and len(search.get("results", [])) >= 1, str(search)[:120])
+    check("search carries warnings array", isinstance(search.get("warnings"), list) and search.get("warnings") == [], str(search.get("warnings"))[:80])
     status, emb, _ = c.request("POST", f"{P}/pages/embed", body={"path": seed_page})
     embedded = emb.get("result", {}).get("vectorsWritten", 0)
     check("pages/embed writes vectors", status == 200 and embedded >= 1, str(emb)[:120])
@@ -282,6 +283,9 @@ def main():
     status, sessions, _ = c.request("GET", f"{P}/chat/sessions")
     ids = [s.get("sessionId") for s in sessions.get("sessions", [])]
     check("session listed", session_id in ids, str(ids)[:100])
+    status, sessions_lim, _ = c.request("GET", f"{P}/chat/sessions?limit=1")
+    lim_ids = [s.get("sessionId") for s in sessions_lim.get("sessions", [])]
+    check("sessions list honors limit=1", status == 200 and len(lim_ids) == 1, f"got {len(lim_ids)}")
     status, history, _ = c.request("GET", f"{P}/chat/sessions/{session_id}?limit=10")
     check("session history has both turns", status == 200 and len(history.get("messages", [])) >= 2, str(history)[:120])
 

@@ -50,7 +50,10 @@ pub fn render(spec: &Value) -> String {
     out.push_str("<section class=\"auth ep\">\n<h2>认证</h2>\n<p>除 <code class=\"inline\">/health</code> 与本页外，所有接口都需要 Bearer Token：\n请求头 <code class=\"inline\">Authorization: Bearer &lt;token&gt;</code>；浏览器访问可在 URL 后追加 <code class=\"inline\">?token=&lt;token&gt;</code>（本页即如此）。</p>\n");
     out.push_str("<p>机器对接请使用机器可读规范：<code class=\"inline\">GET /openapi.json</code>（OpenAPI 3.1，无需认证）。\n下方每个接口都附可直接修改的 curl 示例。</p>\n</section>\n");
 
-    let sample_base = "http://<host>:19828";
+    // Mirror the actual bind port so the curl examples work on deployments
+    // that override LLM_WIKI_BIND_PORT.
+    let sample_port = std::env::var("LLM_WIKI_BIND_PORT").unwrap_or_else(|_| "19828".to_string());
+    let sample_base = format!("http://<host>:{sample_port}");
     if let Some(paths) = spec["paths"].as_object() {
         for (path, path_item) in paths {
             let Some(path_obj) = path_item.as_object() else {
@@ -110,7 +113,7 @@ pub fn render(spec: &Value) -> String {
                     }
                 }
 
-                let curl = curl_example(sample_base, path, method_lower, op);
+                let curl = curl_example(&sample_base, path, method_lower, op);
                 out.push_str("<pre><code>");
                 push_escaped(&mut out, &curl);
                 out.push_str("</code></pre>\n</section>\n");

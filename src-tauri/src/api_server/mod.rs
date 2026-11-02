@@ -564,7 +564,10 @@ fn handle_search(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse 
     // Embedding is optional by design: if resolution fails (provider
     // misconfig, upstream outage) degrade to keyword-only search instead
     // of failing the whole request — the failure is server-side, not the
-    // client's fault.
+    // client's fault. The degradation is surfaced to the client via the
+    // response's `warnings` array; the provider error detail stays in the
+    // server log.
+    let mut warnings: Vec<String> = Vec::new();
     let query_embedding =
         match app.block_on(commands::search::resolve_query_embedding(
             &query,
@@ -576,6 +579,8 @@ fn handle_search(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse 
                 eprintln!(
                     "[api] query embedding unavailable, falling back to keyword-only: {e}"
                 );
+                warnings
+                    .push("embedding provider unavailable — results are keyword-only".to_string());
                 None
             }
         };
@@ -594,6 +599,7 @@ fn handle_search(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse 
             "tokenHits": search.token_hits,
             "vectorHits": search.vector_hits,
             "graphHits": search.graph_hits,
+            "warnings": warnings,
             "results": search.results,
         })),
         Err(e) => err_internal("handler error", e),
@@ -929,14 +935,21 @@ fn handle_cancel_chat(app: &ServerHost, project_id: &str, session_id: &str) -> A
 /// GET /api/v1/projects/{id}/chat/sessions
 ///
 /// Lists the agent chat sessions persisted under the project, newest first
-/// (by `updatedAt`). Powers the web client's session switcher.
-fn handle_list_chat_sessions(app: &ServerHost, project_id: &str) -> ApiResponse {
+/// (by `updatedAt`). `?limit=N` (default 100, max 500) caps the response.
+fn handle_list_chat_sessions(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse {
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
         Err(e) => return err(404, e),
     };
+    let params = parse_query(query);
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
     let mut sessions = app.sessions().list_sessions(&project.path);
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.truncate(limit);
     ok(json!({
         "ok": true,
         "projectId": project.id,
@@ -2890,10 +2903,14 @@ mod tests {
         // Register the temp project so resolve_project can find it by path.
         project_registry::set_current_project_path(&root_str);
 
-        let listed = handle_list_chat_sessions(&host, "current");
+        let listed = handle_list_chat_sessions(&host, "current", "");
         assert_eq!(listed.status, 200);
         assert_eq!(listed.body["sessions"][0]["sessionId"], "sess-1");
         assert_eq!(listed.body["sessions"][0]["updatedAt"], 42);
+
+        let limited = handle_list_chat_sessions(&host, "current", "limit=1");
+        assert_eq!(limited.status, 200);
+        assert_eq!(limited.body["sessions"].as_array().unwrap().len(), 1);
 
         let fetched = handle_get_chat_session(&host, "current", "sess-1", "limit=2");
         assert_eq!(fetched.status, 200);

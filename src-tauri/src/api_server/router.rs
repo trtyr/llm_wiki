@@ -275,7 +275,7 @@ fn handle_request(
             handle_cancel_chat(app, project_id, session_id)
         }
         (&Method::Get, ["projects", project_id, "chat", "sessions"]) => {
-            handle_list_chat_sessions(app, project_id)
+            handle_list_chat_sessions(app, project_id, query)
         }
         (&Method::Get, ["projects", project_id, "chat", "sessions", session_id]) => {
             handle_get_chat_session(app, project_id, session_id, query)

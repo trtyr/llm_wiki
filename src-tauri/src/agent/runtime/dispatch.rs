@@ -574,10 +574,32 @@ pub(crate) fn emit_event(
 
 pub(crate) fn tool_emit_event(
     tool_events: &mut Vec<AgentToolEvent>,
-    _events: &mut Vec<AgentEvent>,
-    _event_sink: &Option<AgentEventSink>,
+    events: &mut Vec<AgentEvent>,
+    event_sink: &Option<AgentEventSink>,
     tool_event: AgentToolEvent,
 ) {
+    // Mirror tool progress into the AgentEvent stream so SSE clients see
+    // the started/completed/failed lifecycle (the blocking response carries
+    // the full toolEvents list; this is the streaming counterpart).
+    match tool_event.status.as_str() {
+        "started" => emit_event(
+            events,
+            event_sink,
+            AgentEvent::ToolStart {
+                tool: tool_event.tool.clone(),
+                input: tool_event.detail.clone(),
+            },
+        ),
+        "completed" | "failed" => emit_event(
+            events,
+            event_sink,
+            AgentEvent::ToolEnd {
+                tool: tool_event.tool.clone(),
+                output: tool_event.detail.clone(),
+            },
+        ),
+        _ => {} // informational statuses (e.g. "available") are not lifecycle events
+    }
     tool_events.push(tool_event);
 }
 

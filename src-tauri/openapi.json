@@ -675,7 +675,8 @@
           "200": {
             "description": "{ ok, mode, tokenHits, vectorHits, graphHits, results }"
           }
-        }
+        },
+        "description": "If the query embedding cannot be resolved (provider misconfigured or unreachable), the search degrades to keyword-only and the response carries warnings: [\"embedding provider unavailable - results are keyword-only\"]."
       }
     },
     "/api/v1/projects/{projectId}/graph": {
@@ -837,13 +838,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100
+            },
+            "description": "Cap the number of returned sessions (newest first)"
           }
         ],
         "responses": {
           "200": {
             "description": "{ ok, sessions: [{sessionId, projectId, messages, updatedAt}] }"
           }
-        }
+        },
+        "description": "Response is capped by limit (default 100, max 500)."
       }
     },
     "/api/v1/projects/{projectId}/chat/sessions/{sessionId}": {
