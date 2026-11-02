@@ -54,3 +54,4 @@ scripts/llm-server.config.json
 # Brainstorm assets (not tracked in source control)
 .superpowers/
 .claude/
+scripts/e2e_test.py
