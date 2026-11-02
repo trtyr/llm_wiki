@@ -77,7 +77,10 @@ impl AgentCancellationRegistry {
             normalize_key(session_id)
         );
         let token = {
-            let tokens = self.tokens.lock().unwrap();
+            let tokens = self
+                .tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(run_id) = run_id {
                 tokens
                     .get(&cancel_key(project_id, session_id, run_id))

@@ -9,9 +9,7 @@ pub fn request_origin(request: &tiny_http::Request) -> Option<String> {
 }
 
 pub fn is_allowed_browser_origin(origin: &str) -> bool {
-    origin.starts_with("chrome-extension://")
-        || origin.starts_with("moz-extension://")
-        || origin == "http://localhost"
+    origin == "http://localhost"
         || origin.starts_with("http://localhost:")
         || origin == "http://127.0.0.1"
         || origin.starts_with("http://127.0.0.1:")
@@ -58,8 +56,6 @@ mod tests {
     #[test]
     fn allowed_browser_origins_are_narrowly_scoped() {
         for origin in [
-            "chrome-extension://abc",
-            "moz-extension://abc",
             "http://localhost",
             "http://localhost:19827",
             "http://127.0.0.1:5500",

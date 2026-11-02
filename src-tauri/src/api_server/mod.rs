@@ -102,9 +102,8 @@ pub fn get_api_status() -> &'static str {
     }
 }
 
-/// Kept for the upcoming settings API (PUT /settings) — the app-state
-/// cache must be dropped when config changes arrive over HTTP. PUT
-/// /settings calls this after every write.
+/// Drops the app-state config cache so the next request re-reads
+/// app-state.json from disk. PUT /settings calls this after every write.
 pub fn invalidate_config_cache() {
     if let Some(lock) = APP_STATE_CACHE.get() {
         if let Ok(mut cache) = lock.lock() {
