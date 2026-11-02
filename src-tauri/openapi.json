@@ -914,8 +914,12 @@
     "/docs": {
       "get": {
         "summary": "Human-readable API documentation page (Chinese)",
-        "description": "Rendered from this OpenAPI document with curl examples per endpoint. Browser auth via query token: /docs?token=<token>.",
-        "security": [],
+        "description": "Rendered Chinese HTML documentation page. Auth: bearer token via Authorization header or ?token=<token> query parameter. Honors the api_enabled kill switch (503 when disabled).",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "parameters": [
           {
             "name": "token",

@@ -37,13 +37,11 @@ use projects::{
 
 mod reviews;
 
-use reviews::{
-    handle_bulk_resolve_reviews, handle_delete_review, handle_patch_review, handle_reviews,
-};
+use reviews::{handle_bulk_resolve_reviews, handle_delete_review, handle_patch_review, handle_reviews};
 #[cfg(test)]
 use reviews::{
-    load_review_items, normalize_review_title, parse_review_query, resolve_review_items,
-    review_id_for_parts,
+    delete_review_item, load_review_items, normalize_review_title, parse_review_query,
+    patch_review_item, resolve_review_items, review_id_for_parts, BulkResolveRequest,
 };
 mod respond;
 
@@ -51,14 +49,12 @@ use respond::{allow_request, ok, err, respond_error, respond_json, respond_optio
               should_rate_limit, ApiResponse};
 use router::{cors_headers, process_request};
 #[cfg(test)]
-use std::path::PathBuf;
 #[cfg(test)]
 use auth::constant_time_eq;
 #[cfg(test)]
 use projects::project_path_matches;
 #[cfg(test)]
-use router::{body_limit_for_request, is_agent_chat_request, is_token_required_request,
-             wants_streaming_chat};
+use router::{body_limit_for_request, is_token_required_request, wants_streaming_chat};
 
 use params::{percent_decode, split_url};
 pub(crate) use params::parse_query;
@@ -2452,25 +2448,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn chat_routes_are_recognized_as_agent_requests() {
-        assert!(is_agent_chat_request(
-            &Method::Post,
-            "/api/v1/projects/current/chat"
-        ));
-        assert!(is_agent_chat_request(
-            &Method::Post,
-            "/api/v1/projects/current/chat/session-1/cancel"
-        ));
-        assert!(!is_agent_chat_request(
-            &Method::Post,
-            "/api/v1/projects/current/search"
-        ));
-        assert!(!is_agent_chat_request(
-            &Method::Get,
-            "/api/v1/projects/current/chat"
-        ));
-    }
 
     #[test]
     fn paid_or_mutating_agent_routes_always_require_a_token() {
@@ -2486,9 +2463,29 @@ mod tests {
             &Method::Post,
             "/api/v1/projects/current/chat"
         ));
+        assert!(is_token_required_request(
+            &Method::Delete,
+            "/api/v1/projects/current/files/content?path=wiki/x.md"
+        ));
+        assert!(is_token_required_request(
+            &Method::Put,
+            "/api/v1/settings"
+        ));
+        assert!(is_token_required_request(
+            &Method::Post,
+            "/api/v1/projects/create"
+        ));
+        assert!(is_token_required_request(
+            &Method::Post,
+            "/api/v1/projects/current/history/restore"
+        ));
         assert!(!is_token_required_request(
             &Method::Post,
             "/api/v1/projects/current/search"
+        ));
+        assert!(!is_token_required_request(
+            &Method::Get,
+            "/api/v1/projects/current/graph"
         ));
         assert!(!is_token_required_request(
             &Method::Get,

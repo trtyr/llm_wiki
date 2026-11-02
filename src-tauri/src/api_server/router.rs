@@ -33,11 +33,24 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
     };
 
     let (path, query) = split_url(&url);
+    // Access log: mutating requests are always logged so deletes, config
+    // writes and history restores can be reconstructed from the console.
+    if matches!(
+        method,
+        Method::Post | Method::Put | Method::Patch | Method::Delete
+    ) {
+        eprintln!("[api] {} {}", method, url);
+    }
     if method == Method::Get && (path == "/docs" || path == "/docs/") {
         // Human-readable API documentation. Same authorization semantics
         // as every other read endpoint: allowUnauthenticated opens it, a
         // configured token gates it. Browsers authenticate via the query
         // token since they cannot set Authorization headers.
+        // Honors the api_enabled kill switch like the rest of the API.
+        if !api_enabled(&app) {
+            respond_error(request, 503, "API server is disabled", origin.as_deref());
+            return;
+        }
         if !is_authorized(&app, query, &headers) {
             respond_error(
                 request,
@@ -259,15 +272,19 @@ fn handle_request(
 
 
 
-pub(super) fn is_agent_chat_request(method: &Method, path: &str) -> bool {
+/// Chat (agent) routes always require a token: they execute tools and can
+/// invoke shell commands, so they are never anonymous.
+fn is_agent_chat_request(method: &Method, path: &str) -> bool {
+    if method != &Method::Post {
+        return false;
+    }
     let Some(parts) = api_path_parts(path) else {
         return false;
     };
-    method == &Method::Post
-        && matches!(
-            parts.as_slice(),
-            ["projects", _, "chat"] | ["projects", _, "chat", _, "cancel"]
-        )
+    matches!(
+        parts.as_slice(),
+        ["projects", _, "chat"] | ["projects", _, "chat", _, "cancel"]
+    )
 }
 
 pub(super) fn is_token_required_request(method: &Method, path: &str) -> bool {
@@ -277,11 +294,15 @@ pub(super) fn is_token_required_request(method: &Method, path: &str) -> bool {
     let Some(parts) = api_path_parts(path) else {
         return false;
     };
-    method == &Method::Post
-        && matches!(
-            parts.as_slice(),
-            ["projects", _, "pages", "embed"] | ["projects", _, "pages", "write"]
-        )
+    // allowUnauthenticated opens READS only — search/graph/files listing
+    // and file content are governed by is_authorized instead. Every
+    // mutating verb requires a token even when the switch is on, otherwise
+    // a LAN peer could delete files or rewrite the config anonymously.
+    !matches!(
+        (method, parts.as_slice()),
+        (&Method::Get, _)
+            | (&Method::Post, ["projects", _, "search"])
+    )
 }
 
 fn chat_project_id<'a>(method: &Method, path: &'a str) -> Option<&'a str> {

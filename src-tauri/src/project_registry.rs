@@ -1,9 +1,10 @@
 //! Process-wide current-project registry.
 //!
-//! Originally the state of the Chrome-extension clip server; since the
-//! extension (and the clip server) were removed, this remains as the
-//! lightweight way for the headless server (`LLM_WIKI_PROJECT_PATH`) and
-//! future API routes to pin which project "current" refers to.
+//! Tracks which project "current" refers to for this server process.
+//! Registrations made through the API are persisted into app-state.json
+//! `projectRegistry` (see persist_project_registration in api_server);
+//! `LLM_WIKI_PROJECT_PATH` pins the startup project for the headless
+//! server.
 
 use std::sync::Mutex;
 

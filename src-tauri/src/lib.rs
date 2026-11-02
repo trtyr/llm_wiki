@@ -2,8 +2,8 @@
 //!
 //! Pure server crate: everything here is consumed by the headless
 //! `llm-server` binary (src/bin/llm-server.rs) — the HTTP API
-//! (`api_server`), the browser-extension clip server (`clip_server`),
-//! the agent runtime (`agent`), and the document/queue/vector engine
+//! (`api_server`) and the agent runtime (`agent`), with the document and
+//! vector engine (`commands`),
 //! (`commands`). There is no GUI shell; see `headless` for startup.
 
 mod agent;

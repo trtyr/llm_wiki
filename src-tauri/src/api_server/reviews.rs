@@ -1,6 +1,8 @@
 //! Review store: review.json read/modify/write, sanitization and the
 //! review HTTP handlers. Extracted from api_server/mod.rs.
 
+use std::sync::Mutex;
+
 use super::*;
 
 pub(super) fn parse_review_query(query: &str) -> Result<ReviewQuery, String> {
@@ -385,6 +387,9 @@ pub(super) fn handle_patch_review(
     review_id: &str,
     body: &str,
 ) -> ApiResponse {
+    // Serialize the read-modify-write cycle against concurrent
+    // PATCH/DELETE/bulk-resolve requests.
+    let _review_guard = REVIEW_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
         Err(e) => return err(404, e),
@@ -415,15 +420,16 @@ pub(super) fn handle_patch_review(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BulkResolveRequest {
+pub(super) struct BulkResolveRequest {
     /// Review item ids to resolve. Required, non-empty.
     #[serde(alias = "reviewIds")]
-    ids: Vec<String>,
+    pub(super) ids: Vec<String>,
     /// Optional label applied to every resolved item.
-    action: Option<String>,
+    pub(super) action: Option<String>,
 }
 
 pub(super) fn handle_delete_review(app: &ServerHost, project_id: &str, review_id: &str) -> ApiResponse {
+    let _review_guard = REVIEW_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
         Err(e) => return err(404, e),
@@ -464,6 +470,7 @@ pub(super) fn delete_review_item(project_path: &str, review_id: &str) -> Result<
 /// rather than 404 — 404 is reserved for the single-item PATCH where
 /// one unknown id is the entire request.
 pub(super) fn handle_bulk_resolve_reviews(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse {
+    let _review_guard = REVIEW_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
         Err(e) => return err(404, e),
@@ -615,9 +622,21 @@ pub(super) fn read_raw_review_array(path: &Path) -> Result<Option<Value>, String
     Ok(Some(parsed))
 }
 
+/// Serializes the read-modify-write cycles in patch/delete/bulk-resolve so
+/// concurrent requests cannot lose updates or interleave torn writes.
+pub(super) static REVIEW_LOCK: Mutex<()> = Mutex::new(());
+
 pub(super) fn write_raw_review_array(path: &Path, parsed: &Value) -> Result<(), String> {
     let serialized = serde_json::to_string_pretty(parsed)
         .map_err(|err| format!("Failed to serialize review state: {err}"))?;
-    fs::write(path, serialized).map_err(|err| format!("Failed to write review state: {err}"))
+    // Atomic tmp+rename: a torn review.json previously surfaced as a 500
+    // on the next read.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serialized)
+        .map_err(|err| format!("Failed to write review state tmp: {err}"))?;
+    fs::rename(&tmp, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to replace review state: {err}")
+    })
 }
 

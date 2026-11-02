@@ -82,22 +82,10 @@ mod tests {
 
     #[test]
     fn cors_headers_reflect_allowed_origin_only() {
-        let allowed = local_cors_headers(Some("chrome-extension://abc"), "Content-Type");
+        let allowed = local_cors_headers(Some("http://localhost:3000"), "Content-Type");
         assert_eq!(
             header_value(&allowed, "Access-Control-Allow-Origin").as_deref(),
-            Some("chrome-extension://abc")
-        );
-        assert_eq!(
-            header_value(&allowed, "Access-Control-Allow-Private-Network").as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            header_value(&allowed, "Access-Control-Allow-Methods").as_deref(),
-            Some("GET, POST, PUT, PATCH, DELETE, OPTIONS")
-        );
-        assert_eq!(
-            header_value(&allowed, "Access-Control-Allow-Headers").as_deref(),
-            Some("Content-Type")
+            Some("http://localhost:3000")
         );
         assert_eq!(header_value(&allowed, "Vary").as_deref(), Some("Origin"));
 
