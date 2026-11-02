@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
@@ -33,7 +33,7 @@ mod planner;
 use dispatch::{emit_event, tool_emit_event};
 use planner::{
     escape_planner_xml, extract_json_object, parse_model_tool_plan, planned_tool_queries,
-    shell_command_from_call, should_plan_tools_with_model, ModelToolCall, ModelToolPlan,
+    shell_command_from_call, should_plan_tools_with_model, ModelToolPlan,
 };
 use super::workspace::agent_workspace_display;
 

@@ -4,9 +4,6 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use serde_json::Value;
-
-use super::{AgentSkill, AgentSkillMode};
 use crate::agent::types::{AgentMode, AgentToolOptions};
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -5,7 +5,7 @@ use super::*;
 
 impl AgentRuntime {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub(crate) async fn execute_agent_loop_tool(
+    pub(super) async fn execute_agent_loop_tool(
         &self,
         request: &AgentChatRequest,
         action: &AgentLoopAction,

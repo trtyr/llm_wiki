@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 
 use std::io::Read;
@@ -41,6 +41,8 @@ use respond::{allow_request, ok, err, respond_error, respond_json, respond_optio
               should_rate_limit, ApiResponse};
 use router::{cors_headers, process_request};
 #[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
 use auth::constant_time_eq;
 #[cfg(test)]
 use projects::project_path_matches;
@@ -82,7 +84,7 @@ static API_STATUS: AtomicU8 = AtomicU8::new(0);
 static IN_FLIGHT_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static IN_FLIGHT_CHAT_STREAMS: AtomicUsize = AtomicUsize::new(0);
 static IN_FLIGHT_PAGE_EMBEDS: AtomicUsize = AtomicUsize::new(0);
-static APP_STATE_CACHE: OnceLock<Mutex<Option<CachedAppState>>> = OnceLock::new();
+static APP_STATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedAppState>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct CachedAppState {
@@ -101,12 +103,12 @@ pub fn get_api_status() -> &'static str {
 }
 
 /// Kept for the upcoming settings API (PUT /settings) — the app-state
-/// cache must be dropped when config changes arrive over HTTP.
-#[allow(dead_code)]
+/// cache must be dropped when config changes arrive over HTTP. PUT
+/// /settings calls this after every write.
 pub fn invalidate_config_cache() {
     if let Some(lock) = APP_STATE_CACHE.get() {
         if let Ok(mut cache) = lock.lock() {
-            *cache = None;
+            cache.clear();
         }
     }
 }
@@ -229,10 +231,11 @@ fn try_acquire_request_slot() -> Option<RequestSlot> {
 
 fn load_app_state(app: &ServerHost) -> Option<Value> {
     let now = Instant::now();
-    let lock = APP_STATE_CACHE.get_or_init(|| Mutex::new(None));
+    let path = app.app_state_path()?;
+    let cache_map = APP_STATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut previous = None;
-    if let Ok(cache) = lock.lock() {
-        if let Some(cached) = cache.as_ref() {
+    if let Ok(cache) = cache_map.lock() {
+        if let Some(cached) = cache.get(&path) {
             if now.duration_since(cached.loaded_at) < APP_STATE_CACHE_TTL {
                 return cached.value.clone();
             }
@@ -240,17 +243,19 @@ fn load_app_state(app: &ServerHost) -> Option<Value> {
         }
     }
 
-    let path = app.app_state_path()?;
-    let loaded = fs::read_to_string(path)
+    let loaded = fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
     let value = loaded.or(previous);
 
-    if let Ok(mut cache) = lock.lock() {
-        *cache = Some(CachedAppState {
-            loaded_at: now,
-            value: value.clone(),
-        });
+    if let Ok(mut cache) = cache_map.lock() {
+        cache.insert(
+            path.clone(),
+            CachedAppState {
+                loaded_at: now,
+                value: value.clone(),
+            },
+        );
     }
     value
 }
@@ -409,7 +414,16 @@ fn handle_file_content(app: &ServerHost, project_id: &str, query: &str) -> ApiRe
             "path": rel,
             "content": content,
         })),
-        Err(_) => err(415, "File is not valid UTF-8 text"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            err(404, format!("File not found: {}", rel))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            err(403, format!("File is not readable: {}", e))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            err(415, "File is not valid UTF-8 text")
+        }
+        Err(e) => err(500, format!("Failed to read file: {}", e)),
     }
 }
 
@@ -1786,6 +1800,41 @@ fn load_source_watch_config(
     })
 }
 
+/// Persist a project registration into app-state.json `projectRegistry`
+/// so API-created projects survive a server restart (the in-memory
+/// project_registry is process-local by design).
+fn persist_project_registration(app: &ServerHost, id: &str, name: &str, path: &str) {
+    let Some(store) = app.app_state_path() else {
+        return;
+    };
+    // Atomic write-then-rename, mirroring handle_put_settings.
+    let existing = match fs::read_to_string(&store) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(v) if v.is_object() => v,
+            _ => return,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(_) => return,
+    };
+    let mut merged = existing;
+    if let Some(map) = merged.as_object_mut() {
+        let registry = map
+            .entry("projectRegistry".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(reg) = registry.as_object_mut() {
+            reg.insert(
+                id.to_string(),
+                json!({ "name": name, "path": path.replace('\\', "/") }),
+            );
+        }
+    }
+    let tmp = store.with_extension("json.tmp");
+    if fs::write(&tmp, serde_json::to_string_pretty(&merged).unwrap_or_default()).is_ok() {
+        let _ = fs::rename(&tmp, &store);
+    }
+    invalidate_config_cache();
+}
+
 const OPENAPI_JSON: &str = include_str!("../../openapi.json");
 
 fn openapi_document() -> Value {
@@ -1826,10 +1875,27 @@ fn handle_put_settings(app: &ServerHost, body: &str) -> ApiResponse {
         Ok(v) if v.is_object() => v,
         _ => return err(400, "Body must be a JSON object of config sections"),
     };
-    let mut merged: Value = fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or_else(|| json!({}));
+    // A missing file is a legitimate first run (empty base); anything
+    // else — IO failure, corrupt JSON — must REFUSE the write instead of
+    // silently treating the config as empty and wiping token + keys.
+    let existing_raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return err(500, format!("app-state.json is unreadable ({}); refusing to overwrite", e))
+        }
+    };
+    let mut merged: Value = if existing_raw.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str::<Value>(&existing_raw) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                return err(500,
+                    "app-state.json is corrupt or not a JSON object; refusing to overwrite — fix or move the file first")
+            }
+        }
+    };
     deep_merge_masked(&mut merged, &update);
     // Atomic write: a torn app-state.json loses the API token and every
     // provider key on restart, so write-then-rename, never in-place.
@@ -1911,7 +1977,7 @@ fn deep_merge_masked(existing: &mut Value, update: &Value) {
 /// POST /api/v1/projects/create — scaffold a new wiki project directory
 /// (wiki/, raw/sources/, purpose.md, schema.md, .llm-wiki/project.json)
 /// and pin it as the "current" project.
-fn handle_create_project(_app: &ServerHost, body: &str) -> ApiResponse {
+fn handle_create_project(app: &ServerHost, body: &str) -> ApiResponse {
     #[derive(Deserialize)]
     struct CreateProjectRequest {
         name: String,
@@ -1947,6 +2013,8 @@ fn handle_create_project(_app: &ServerHost, body: &str) -> ApiResponse {
     };
     project_registry::register_project(&req.name, &project.path);
     project_registry::set_current_project_path(&project.path);
+    let project_id = read_project_id(&project.path).unwrap_or_else(|| project.path.clone());
+    persist_project_registration(app, &project_id, name, &project.path);
     invalidate_graph_cache(&project.path);
     let project_id = match read_project_id(&project.path) {
         Some(id) => id,
@@ -1978,7 +2046,7 @@ fn handle_create_project(_app: &ServerHost, body: &str) -> ApiResponse {
 
 /// POST /api/v1/projects/current — body {path}: re-pin the project that
 /// "current" refers to (replaces the old MCP set_project capability).
-fn handle_set_current_project(_app: &ServerHost, body: &str) -> ApiResponse {
+fn handle_set_current_project(app: &ServerHost, body: &str) -> ApiResponse {
     #[derive(Deserialize)]
     struct SetCurrentRequest {
         path: String,
@@ -1991,13 +2059,14 @@ fn handle_set_current_project(_app: &ServerHost, body: &str) -> ApiResponse {
     if !root.is_dir() {
         return err(404, format!("Project directory not found: {}", req.path));
     }
-    project_registry::register_project(
-        root.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Project"),
-        &req.path,
-    );
+    let display_name = std::path::Path::new(&req.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Project");
+    project_registry::register_project(display_name, &req.path);
     project_registry::set_current_project_path(&req.path);
+    let project_id = read_project_id(&req.path).unwrap_or_else(|| req.path.clone());
+    persist_project_registration(app, &project_id, display_name, &req.path);
     invalidate_config_cache();
     ok(json!({ "ok": true, "current": req.path.replace('\\', "/") }))
 }
@@ -3140,73 +3209,47 @@ mod tests {
     }
 
     #[test]
-    fn api_config_shape_parses_enabled_and_unauthenticated_access() {
-        // Standalone pure-function check to mirror what `api_enabled`
-        // reads off `load_app_state`. Mirrors the JS-side shape
-        // emitted by `saveApiConfig` so any rename on either side
-        // surfaces here before users hit it as a 503 in production.
-        let payload = json!({
-            "apiConfig": {
-                "enabled": false,
-                "allowUnauthenticated": true,
-                "allowLanAccess": true,
-                "mcpEnabled": true,
-                "token": "abc"
-            }
-        });
-        let enabled = payload
-            .get("apiConfig")
-            .and_then(|v| v.get("enabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        assert!(!enabled);
-        let allow_unauthenticated = payload
-            .get("apiConfig")
-            .and_then(|v| v.get("allowUnauthenticated"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        assert!(allow_unauthenticated);
-        let allow_lan_access = payload
-            .get("apiConfig")
-            .and_then(|v| v.get("allowLanAccess"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        assert!(allow_lan_access);
-        let mcp_enabled = payload
-            .get("apiConfig")
-            .and_then(|v| v.get("mcpEnabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        assert!(mcp_enabled);
-        let token_source = payload
-            .get("apiConfig")
-            .and_then(|v| v.get("token"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|_| "store")
-            .unwrap_or("none");
-        assert_eq!(token_source, "store");
+    fn api_config_shape_matches_production_readers() {
+        // Exercises the production api_enabled/api_allow_unauthenticated/
+        // api_mcp_enabled readers against a temp app-state.json so a
+        // production regression fails here instead of surfacing as a 503.
+        let dir = std::env::temp_dir().join(format!(
+            "llm-wiki-apicfg-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("app-state.json");
+        fs::write(
+            &store,
+            json!({
+                "apiConfig": {
+                    "enabled": false,
+                    "allowUnauthenticated": true,
+                    "allowLanAccess": true,
+                    "mcpEnabled": true
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
 
-        let missing = json!({});
-        let enabled_missing = missing
-            .get("apiConfig")
-            .and_then(|v| v.get("enabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        // Fail-open by design — see `api_enabled` doc comment.
-        assert!(enabled_missing);
-        let mcp_enabled_missing = missing
-            .get("apiConfig")
-            .and_then(|v| v.get("mcpEnabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        assert!(!mcp_enabled_missing);
-        let allow_lan_access_missing = missing
-            .get("apiConfig")
-            .and_then(|v| v.get("allowLanAccess"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        assert!(!allow_lan_access_missing);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = ServerHost::new(
+            Some(store.clone()),
+            Default::default(),
+            Default::default(),
+            rt.handle().clone(),
+        );
+        assert!(!api_enabled(&host));
+        assert!(api_allow_unauthenticated(&host));
+        assert!(api_mcp_enabled(&host));
+
+        // Defaults with no config file at all.
+        let empty = ServerHost::new(None, Default::default(), Default::default(), rt.handle().clone());
+        assert!(api_enabled(&empty));
+        assert!(!api_allow_unauthenticated(&empty));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

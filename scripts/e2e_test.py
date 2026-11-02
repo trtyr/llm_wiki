@@ -140,6 +140,8 @@ def main():
     print("\n[3] settings read/write")
     status, before, _ = c.request("GET", "/api/v1/settings")
     check("settings GET returns object", status == 200 and isinstance(before, dict), str(before)[:80])
+    check("settings GET carries llmConfig", isinstance(before.get("llmConfig"), dict), str(before.get("llmConfig"))[:60])
+    check("settings GET masks apiKey", before.get("llmConfig", {}).get("apiKey") in (None, "********"), "apiKey must not be returned in clear")
     probe = "e2e-probe-" + uuid.uuid4().hex[:8]
     status, merged, _ = c.request(
         "PUT", "/api/v1/settings",
@@ -157,6 +159,7 @@ def main():
     print("\n[4] projects: list / create / current pinning")
     status, before_projects, _ = c.request("GET", "/api/v1/projects")
     check("projects list ok", status == 200 and "projects" in before_projects, "")
+    check("projects list carries currentProject", "currentProject" in before_projects, str(before_projects)[:120])
     default_path = (before_projects.get("currentProject") or {}).get("path", "")
     stamp = uuid.uuid4().hex[:8]
     parent = None
@@ -257,7 +260,7 @@ def main():
     # ------------------------------------------------------------------
     print("\n[8] reviews")
     status, reviews, _ = c.request("GET", f"{P}/reviews")
-    check("reviews list ok", status == 200 and "reviews" in str(reviews)[:200] or status == 200, str(reviews)[:100])
+    check("reviews list ok", status == 200 and "reviews" in str(reviews)[:200], str(reviews)[:100])
 
     # ------------------------------------------------------------------
     print("\n[9] chat: blocking / SSE / cancel / sessions")
@@ -295,7 +298,7 @@ def main():
             break
     conn.close()
     sse_text = buf.decode("utf-8", "replace")
-    check("SSE: content-type event-stream or json", "event-stream" in ctype or "json" in ctype, ctype)
+    check("SSE: content-type is event-stream", "text/event-stream" in ctype, ctype)
     check("SSE: meta frame present", "event: meta" in sse_text, sse_text[:120])
     check("SSE: agent events present", "event: agent" in sse_text, "")
     check("SSE: done frame present", "event: done" in sse_text, sse_text[-200:])
@@ -309,8 +312,10 @@ def main():
             timeout=5,
         )
         check("long chat still running after 5s", False, "finished too fast to cancel")
-    except (TimeoutError, OSError):
+    except TimeoutError:
         check("long chat still running after 5s", True, "")
+    except OSError as err:
+        check("long chat still running after 5s", False, f"connection failed: {err}")
     time.sleep(1.5)
     status, cancel_res, _ = c.request("POST", f"{P}/chat/{cancel_session}/cancel")
     check("cancel endpoint responds", status == 200 and cancel_res.get("cancelled") is True, str(cancel_res)[:100])

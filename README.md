@@ -327,7 +327,9 @@ The original mentions Obsidian Web Clipper. We built a **dedicated Chrome Extens
 - **Mozilla Readability.js** for accurate article extraction (strips ads, nav, sidebars)
 - **Turndown.js** for HTML → Markdown conversion with table support
 - **Project picker** — choose which wiki to clip into (supports multi-project)
-- **Local HTTP API** (port 19827, tiny_http) — Extension ↔ App communication
+- **Local HTTP API** (port 19828, tiny_http) — headless service for agents
+  (the legacy clip server / browser extension was removed in the pure-backend
+  refactor)
 - **Auto-ingest** — clipped content automatically triggers the two-step ingest pipeline
 - **Clip watcher** — polls every 3 seconds for new clips, processes automatically
 - **Offline preview** — shows extracted content even when app is not running

@@ -34,13 +34,15 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
 
     let (path, query) = split_url(&url);
     if method == Method::Get && (path == "/docs" || path == "/docs/") {
-        // Human-readable API documentation; browsers authenticate via the
-        // query token since they cannot set Authorization headers.
-        if !is_token_authorized(&app, query, &headers) {
+        // Human-readable API documentation. Same authorization semantics
+        // as every other read endpoint: allowUnauthenticated opens it, a
+        // configured token gates it. Browsers authenticate via the query
+        // token since they cannot set Authorization headers.
+        if !is_authorized(&app, query, &headers) {
             respond_error(
                 request,
                 401,
-                "Unauthorized: append ?token=<your token> to the URL",
+                "Unauthorized: append ?token=<your token> to the URL (or enable allowUnauthenticated)",
                 origin.as_deref(),
             );
             return;

@@ -372,6 +372,12 @@ pub async fn list_file_history(
     tokio::task::spawn_blocking(move || {
         let (root, file) = checked_file(&project_path, &file_path)?;
         let _guard = HISTORY_LOCK.lock().map_err(|e| e.to_string())?;
+        // A project with no recorded history yet is a normal empty state,
+        // not an error: report an empty list instead of failing.
+        let history_dir = root.join(".llm-wiki/history");
+        if !history_dir.is_dir() {
+            return Ok(Vec::new());
+        }
         checked_history_dir(&root, false)?;
         let store_path = checked_history_file(&root, &file)?;
         let raw = fs::read_to_string(store_path).unwrap_or_else(|_| "[]".to_string());

@@ -61,7 +61,7 @@ impl AgentCancellationRegistry {
         let key = cancel_key(project_id, session_id, run_id);
         self.tokens
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key.clone(), token.clone());
         AgentCancellationToken {
             cancelled: token,
@@ -99,7 +99,7 @@ impl AgentCancellationRegistry {
     pub fn finish(&self, project_id: &str, session_id: &str, run_id: &str) {
         self.tokens
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&cancel_key(project_id, session_id, run_id));
     }
 }
