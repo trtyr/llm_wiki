@@ -226,6 +226,9 @@ fn handle_request(
         (&Method::Delete, ["projects", project_id, "files", "content"]) => {
             handle_delete_file(app, project_id, query)
         }
+        (&Method::Delete, ["projects", project_id]) => {
+            handle_delete_project(app, project_id, query)
+        }
         (&Method::Get, ["projects", project_id, "reviews"]) => {
             handle_reviews(app, project_id, query)
         }

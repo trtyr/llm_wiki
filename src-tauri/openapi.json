@@ -971,6 +971,46 @@
           }
         }
       }
+    },
+    "/api/v1/projects/{projectId}": {
+      "delete": {
+        "summary": "Remove a project from the registry",
+        "description": "Removes the project from app-state.json (projectRegistry + recentProjects, atomic write) and from the in-memory session registry; clears the current pin if it pointed at the removed project. Disk files are KEPT unless deleteFiles=true, which removes the project directory recursively. Deleting by the literal id current is rejected with 400 - pass the explicit project id. Unknown ids return 404.",
+        "parameters": [
+          {
+            "name": "projectId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "deleteFiles",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Also delete the project directory from disk (recursive, irreversible)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{ ok, removed, id, path, filesDeleted }"
+          },
+          "400": {
+            "description": "project id was the literal current"
+          },
+          "404": {
+            "description": "Unknown project id"
+          },
+          "500": {
+            "description": "Directory deletion failed (deleteFiles=true)"
+          }
+        }
+      }
     }
   }
 }

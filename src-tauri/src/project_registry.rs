@@ -44,3 +44,17 @@ pub fn register_project(name: &str, path: &str) {
         }
     }
 }
+
+/// Remove a project from the session registry and clear the `current`
+/// pointer if it pointed at the removed project.
+pub fn remove_project_by_path(path: &str) {
+    let normalized = path.replace('\\', "/");
+    if let Ok(mut guard) = ALL_PROJECTS.lock() {
+        guard.retain(|(_, existing)| *existing != normalized);
+    }
+    if let Ok(mut guard) = CURRENT_PROJECT.lock() {
+        if guard.as_str() == normalized {
+            *guard = String::new();
+        }
+    }
+}

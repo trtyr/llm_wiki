@@ -107,7 +107,7 @@ def main():
     status, body, raw = c.request("GET", "/openapi.json", token="")
     check("openapi: served without auth", status == 200 and body.get("openapi", "").startswith("3.1"), str(body)[:80])
     spec_paths = set(body.get("paths", {}).keys())
-    check("openapi: 26 paths documented", len(spec_paths) == 26, f"got {len(spec_paths)}")
+    check("openapi: 27 paths documented", len(spec_paths) == 27, f"got {len(spec_paths)}")
     status, body, _ = c.request("GET", "/", token="")
     check("root / serves openapi", status == 200 and "openapi" in body, "")
     status, _, raw = c.request("GET", "/docs", token="")
@@ -339,7 +339,20 @@ def main():
     check("5 concurrent searches all 200", all(code == 200 for code in codes), str(codes))
 
     # ------------------------------------------------------------------
-    print("\n[11] cleanup")
+    print("\n[11] projects: DELETE endpoint")
+    status, delcur, _ = c.request("DELETE", "/api/v1/projects/current")
+    check("DELETE by 'current' -> 400", status == 400 and delcur.get("ok") is False, f"{status} {str(delcur)[:80]}")
+    status, del1, _ = c.request("DELETE", f"/api/v1/projects/{project_ref}")
+    check("DELETE by id unregisters (keeps files)", status == 200 and del1.get("removed") is True and del1.get("filesDeleted") is False, str(del1)[:120])
+    check("DELETE keeps the directory on disk", project_dir and Path(project_dir).exists(), project_dir or "?")
+    status, listed2, _ = c.request("GET", "/api/v1/projects")
+    names2 = [p_["name"] for p_ in listed2.get("projects", [])]
+    check("deleted project gone from list", test_name not in names2, str(names2[:5]))
+    status, del2, _ = c.request("DELETE", f"/api/v1/projects/{project_ref}")
+    check("second DELETE -> 404", status == 404, f"got {status}")
+
+    # ------------------------------------------------------------------
+    print("\n[12] cleanup")
     c.request("POST", "/api/v1/projects/current", body={"path": default_path or ""})
     if project_dir and not args.keep:
         try:

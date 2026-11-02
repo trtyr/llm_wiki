@@ -1530,6 +1530,95 @@ fn handle_list_file_history(app: &ServerHost, project_id: &str, query: &str) -> 
     }
 }
 
+/// DELETE /api/v1/projects/{projectId} — remove a project from the
+/// registry. Disk files are kept unless ?deleteFiles=true; with the flag
+/// the project directory is removed recursively. Deleting by 'current' is
+/// rejected — pass the explicit project id.
+fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse {
+    if project_id.eq_ignore_ascii_case("current") {
+        return err(400, "refusing to delete by 'current' — pass the explicit project id");
+    }
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let params = parse_query(query);
+    let delete_files = params.get("deleteFiles").map(|v| v == "true").unwrap_or(false);
+
+    // 1) Remove from app-state.json projectRegistry + recentProjects
+    //    (atomic write-then-rename, preserving every other config key).
+    let mut removed_from_store = false;
+    if let Some(store) = app.app_state_path() {
+        if let Ok(raw) = fs::read_to_string(&store) {
+            if let Ok(mut merged) = serde_json::from_str::<Value>(&raw) {
+                let path_norm = normalize_path(&project.path);
+                if let Some(map) = merged.as_object_mut() {
+                    if let Some(reg) =
+                        map.get_mut("projectRegistry").and_then(Value::as_object_mut)
+                    {
+                        reg.remove(&project.id);
+                        let stale: Vec<String> = reg
+                            .iter()
+                            .filter(|(_, v)| {
+                                v.get("path").and_then(Value::as_str)
+                                    .map(|p| normalize_path(p)).as_deref() == Some(path_norm.as_str())
+                            })
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        for k in stale {
+                            reg.remove(&k);
+                        }
+                    }
+                    if let Some(recents) =
+                        map.get_mut("recentProjects").and_then(Value::as_array_mut)
+                    {
+                        recents.retain(|v| {
+                            v.get("path").and_then(Value::as_str)
+                                .map(|p| normalize_path(p)).as_deref() != Some(path_norm.as_str())
+                        });
+                    }
+                }
+                let tmp = store.with_extension("json.tmp");
+                if fs::write(&tmp, serde_json::to_string_pretty(&merged).unwrap_or_default())
+                    .is_ok()
+                {
+                    if fs::rename(&tmp, &store).is_ok() {
+                        removed_from_store = true;
+                        // The 5s app-state cache would otherwise keep the
+                        // removed project resolvable for the next requests.
+                        invalidate_config_cache();
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Remove from the in-memory session registry; clears 'current' if it
+    //    pointed at the removed project.
+    project_registry::remove_project_by_path(&project.path);
+    invalidate_graph_cache(&project.path);
+
+    // 3) Optional disk removal (off by default).
+    let mut files_deleted = false;
+    if delete_files && !project.path.is_empty() {
+        match fs::remove_dir_all(&project.path) {
+            Ok(()) => files_deleted = true,
+            Err(e) => {
+                return err(500, format!("Failed to delete project directory: {e}"))
+            }
+        }
+    }
+
+    ok(json!({
+        "ok": true,
+        "removed": removed_from_store,
+        "id": project.id,
+        "path": project.path,
+        "filesDeleted": files_deleted,
+    }))
+}
+
+
 /// POST /api/v1/projects/{id}/history/restore — body {path, entryId}.
 fn handle_restore_file_history(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse {
     let project = match resolve_project(app, project_id) {
