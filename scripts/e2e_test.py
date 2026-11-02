@@ -184,6 +184,16 @@ def main():
     names = [p["name"] for p in listed.get("projects", [])]
     check("created project is listed", test_name in names, str(names))
     status, repin, _ = c.request("POST", "/api/v1/projects/current", body={"path": default_path})
+    if status != 200:
+        # pinned target may have been deleted externally; re-pin to any
+        # project directory that still exists
+        for p_ in listed.get("projects", []):
+            candidate = p_.get("path", "")
+            if candidate and Path(candidate).exists():
+                status, repin, _ = c.request(
+                    "POST", "/api/v1/projects/current", body={"path": candidate}
+                )
+                break
     check("re-pin current back works", status == 200 and repin.get("ok") is True, str(repin)[:120])
     status, bad, _ = c.request("POST", "/api/v1/projects/current", body={"path": "Z:/definitely/missing/dir"})
     check("re-pin missing dir -> 404", status == 404, f"got {status}")

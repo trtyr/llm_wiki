@@ -2013,14 +2013,12 @@ fn handle_create_project(app: &ServerHost, body: &str) -> ApiResponse {
     };
     project_registry::register_project(&req.name, &project.path);
     project_registry::set_current_project_path(&project.path);
-    let project_id = read_project_id(&project.path).unwrap_or_else(|| project.path.clone());
-    persist_project_registration(app, &project_id, name, &project.path);
-    invalidate_graph_cache(&project.path);
+    // Ensure the project has a stable identity BEFORE registering it in
+    // app-state — otherwise the registry key falls back to the path and
+    // clients can no longer address the project by the returned id.
     let project_id = match read_project_id(&project.path) {
         Some(id) => id,
         None => {
-            // Newly scaffolded projects have no identity file yet; give
-            // them one so API clients can address them by a stable UUID.
             let id = uuid::Uuid::new_v4().to_string();
             let meta_dir = std::path::Path::new(&project.path).join(".llm-wiki");
             if fs::create_dir_all(&meta_dir).is_ok() {
@@ -2033,6 +2031,8 @@ fn handle_create_project(app: &ServerHost, body: &str) -> ApiResponse {
             id
         }
     };
+    persist_project_registration(app, &project_id, name, &project.path);
+    invalidate_graph_cache(&project.path);
     ok(json!({
         "ok": true,
         "project": {
