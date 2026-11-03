@@ -117,6 +117,87 @@ pub fn invalidate_config_cache() {
     }
 }
 
+/// Process-wide serialization for every app-state.json read-modify-write
+/// (PUT /settings, project registration, project deletion). The file holds
+/// all credentials; concurrent writers with a deterministic tmp name could
+/// lose each other's updates while both reporting success (F-25).
+fn app_state_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    static APP_STATE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Poison recovery: a panicking writer must not wedge every future
+    // config write; the file itself stays consistent via tmp+rename.
+    APP_STATE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Read-modify-write app-state.json under the write lock, persisting via a
+/// unique tmp name + rename. `mutate` receives the parsed current state
+/// (empty object when the file is missing) and returns false to abort
+/// without writing. Error strings are prefixed `corrupt:`/`unreadable:`/
+/// `write:` so callers can classify them.
+fn update_app_state_file(
+    path: &std::path::Path,
+    mutate: impl FnOnce(&mut Value) -> bool,
+) -> Result<(), String> {
+    let _guard = app_state_write_guard();
+    let mut merged = match fs::read_to_string(path) {
+        Ok(raw) if !raw.trim().is_empty() => match serde_json::from_str::<Value>(&raw) {
+            Ok(v) if v.is_object() => v,
+            _ => return Err("corrupt: app-state.json is not a JSON object".to_string()),
+        },
+        Ok(_) => json!({}),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(format!("unreadable: {e}")),
+    };
+    if !mutate(&mut merged) {
+        return Ok(());
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = path.with_extension(format!("json.{}-{nanos}.tmp", std::process::id()));
+    let payload = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    if let Err(e) = fs::write(&tmp, payload) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write: {e}"));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write: rename failed: {e}"));
+    }
+    invalidate_config_cache();
+    Ok(())
+}
+
+/// Ensure `<project>/.llm-wiki/project.json` exists with a stable UUID and
+/// return that id. The identity file is what keeps a project addressable
+/// across restarts, so a failed write must surface as an error instead of
+/// handing out an id that turns into a 404 after the next restart (F-17).
+fn ensure_project_identity(path: &str, name: &str) -> Result<String, String> {
+    if let Some(id) = read_project_id(path) {
+        return Ok(id);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let meta_dir = std::path::Path::new(path).join(".llm-wiki");
+    fs::create_dir_all(&meta_dir)
+        .map_err(|e| format!("failed to create {}: {e}", meta_dir.display()))?;
+    let payload = json!({ "id": id, "name": name });
+    let file = meta_dir.join("project.json");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = meta_dir.join(format!("project.json.{}-{nanos}.tmp", std::process::id()));
+    fs::write(&tmp, serde_json::to_string_pretty(&payload).unwrap_or_default())
+        .map_err(|e| format!("failed to write {}: {e}", file.display()))?;
+    if let Err(e) = fs::rename(&tmp, &file) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("failed to finalize {}: {e}", file.display()));
+    }
+    Ok(id)
+}
+
 pub fn start_api_server(app: ServerHost) {
     thread::spawn(move || loop {
         API_STATUS.store(0, Ordering::Relaxed);
@@ -250,6 +331,16 @@ fn load_app_state(app: &ServerHost) -> Option<Value> {
     let loaded = fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    if loaded.is_none() && (previous.is_some() || path.exists()) {
+        // A hand-edited or corrupt config used to silently keep serving the
+        // stale cached value; say so, or "changed a setting, nothing
+        // happened" becomes undebuggable (F-11).
+        eprintln!(
+            "[api] app-state.json unreadable or corrupt{}; config reads fall back{}",
+            if previous.is_some() { " - serving previous cached value" } else { "" },
+            if previous.is_some() { " to cache" } else { " to empty" },
+        );
+    }
     let value = loaded.or(previous);
 
     if let Ok(mut cache) = cache_map.lock() {
@@ -307,15 +398,27 @@ fn handle_delete_file(app: &ServerHost, project_id: &str, query: &str) -> ApiRes
     }
 
     let mut vectors_cleared = false;
-    let lower = normalize_path(rel).to_lowercase();
-    if lower.starts_with("wiki/") && lower.ends_with(".md") {
-        let page_id = lower[5..lower.len() - 3].to_string();
-        vectors_cleared = app
-            .block_on(commands::vectorstore::vector_delete_page(
+    let mut vectors_failed = false;
+    if let Some(page_id) = commands::vectorstore::canonical_page_id(&normalize_path(rel)) {
+        // The LanceDB filter is an exact string match: try the id as
+        // written, then the all-lowercase form written by older builds,
+        // so pages with uppercase segments cannot leave ghost vectors
+        // behind (F-03). Failures are logged with their cause (F-04)
+        // instead of collapsing into a bare false.
+        let mut candidates = vec![page_id.clone(), page_id.to_lowercase()];
+        candidates.dedup();
+        for candidate in &candidates {
+            match app.block_on(commands::vectorstore::vector_delete_page(
                 project.path.clone(),
-                page_id,
-            ))
-            .is_ok();
+                candidate.clone(),
+            )) {
+                Ok(()) => vectors_cleared = true,
+                Err(e) => {
+                    vectors_failed = true;
+                    eprintln!("[api] vector cleanup failed for page '{candidate}': {e}");
+                }
+            }
+        }
     }
     invalidate_graph_cache(&project.path);
 
@@ -326,6 +429,11 @@ fn handle_delete_file(app: &ServerHost, project_id: &str, query: &str) -> ApiRes
         "historyRecorded": history_recorded,
         "vectorsCleared": vectors_cleared,
     });
+    if vectors_failed {
+        body["vectorsError"] = json!(
+            "vector store update failed - deleted page may still appear in search results (see server log)"
+        );
+    }
     if !history_recorded {
         body["hint"] = json!("file history is disabled for this project; PUT /history/settings {enabled:true} to make deletions restorable");
     }
@@ -1221,36 +1329,34 @@ fn load_source_watch_config(
 /// Persist a project registration into app-state.json `projectRegistry`
 /// so API-created projects survive a server restart (the in-memory
 /// project_registry is process-local by design).
-fn persist_project_registration(app: &ServerHost, id: &str, name: &str, path: &str) {
+fn persist_project_registration(app: &ServerHost, id: &str, name: &str, path: &str) -> bool {
     let Some(store) = app.app_state_path() else {
-        return;
+        return false;
     };
-    // Atomic write-then-rename, mirroring handle_put_settings.
-    let existing = match fs::read_to_string(&store) {
-        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-            Ok(v) if v.is_object() => v,
-            _ => return,
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(_) => return,
-    };
-    let mut merged = existing;
-    if let Some(map) = merged.as_object_mut() {
-        let registry = map
-            .entry("projectRegistry".to_string())
-            .or_insert_with(|| json!({}));
-        if let Some(reg) = registry.as_object_mut() {
-            reg.insert(
-                id.to_string(),
-                json!({ "name": name, "path": path.replace('\\', "/") }),
-            );
+    // Read-modify-write under the app-state lock (F-25); the outcome is
+    // reported so a silent "registered in memory only" project cannot be
+    // returned as ok:true (F-23).
+    let result = update_app_state_file(&store, |merged| {
+        if let Some(map) = merged.as_object_mut() {
+            let registry = map
+                .entry("projectRegistry".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(reg) = registry.as_object_mut() {
+                reg.insert(
+                    id.to_string(),
+                    json!({ "name": name, "path": path.replace('\\', "/") }),
+                );
+            }
+        }
+        true
+    });
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[api] project registration for {id} failed to persist: {e}");
+            false
         }
     }
-    let tmp = store.with_extension("json.tmp");
-    if fs::write(&tmp, serde_json::to_string_pretty(&merged).unwrap_or_default()).is_ok() {
-        let _ = fs::rename(&tmp, &store);
-    }
-    invalidate_config_cache();
 }
 
 const OPENAPI_JSON: &str = include_str!("../../openapi.json");
@@ -1258,13 +1364,23 @@ const OPENAPI_JSON: &str = include_str!("../../openapi.json");
 fn openapi_document() -> Value {
     static PARSED: OnceLock<Value> = OnceLock::new();
     PARSED
-        .get_or_init(|| serde_json::from_str(OPENAPI_JSON).unwrap_or(Value::Null))
+        .get_or_init(|| match serde_json::from_str(OPENAPI_JSON) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "[api] embedded openapi.json failed to parse: {e} - /openapi.json and /docs will be empty"
+                );
+                Value::Null
+            }
+        })
         .clone()
 }
 
 /// GET /api/v1/settings — returns the merged app-state configuration
-/// (llmConfig, embeddingConfig, searchApiConfig, apiConfig, ...). This is
-/// the owner's endpoint: values are NOT masked, the bearer token gates it.
+/// (llmConfig, embeddingConfig, searchApiConfig, apiConfig, ...). Values
+/// under credential-bearing keys are masked as `********`; PUTting the
+/// mask back keeps the existing value (round-trip safe, see
+/// deep_merge_masked). The bearer token gates the endpoint.
 fn handle_get_settings(app: &ServerHost) -> ApiResponse {
     let Some(path) = app.app_state_path() else {
         return err(404, "No app-state file in this deployment");
@@ -1278,7 +1394,7 @@ fn handle_get_settings(app: &ServerHost) -> ApiResponse {
             Err(e) => err(500, format!("app-state.json is not valid JSON: {e}")),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ok(json!({})),
-        Err(e) => err(500, format!("failed to read app-state.json: {e}")),
+        Err(e) => err_internal("settings GET: read failed", e),
     }
 }
 
@@ -1293,58 +1409,57 @@ fn handle_put_settings(app: &ServerHost, body: &str) -> ApiResponse {
         Ok(v) if v.is_object() => v,
         _ => return err(400, "Body must be a JSON object of config sections"),
     };
+    // Read-modify-write runs under the app-state write lock (F-25): a
+    // torn or lost update here drops the API token and every provider key.
     // A missing file is a legitimate first run (empty base); anything
     // else — IO failure, corrupt JSON — must REFUSE the write instead of
     // silently treating the config as empty and wiping token + keys.
-    let existing_raw = match fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
+    let mut merged_out: Option<Value> = None;
+    let result = update_app_state_file(&path, |merged| {
+        deep_merge_masked(merged, &update);
+        merged_out = Some(merged.clone());
+        true
+    });
+    match result {
+        Ok(()) => {}
+        Err(msg) if msg.starts_with("corrupt") => {
             return err_internal(
-                "settings PUT: app-state.json unreadable, refusing overwrite",
-                e,
+                "settings PUT: app-state.json corrupt, refusing overwrite",
+                "app-state.json is corrupt or not a JSON object; refusing to overwrite (see server log)",
             )
         }
-    };
-    let mut merged: Value = if existing_raw.trim().is_empty() {
-        json!({})
-    } else {
-        match serde_json::from_str::<Value>(&existing_raw) {
-            Ok(v) if v.is_object() => v,
-            _ => {
-                return err_internal(
-                    "settings PUT: app-state.json corrupt, refusing overwrite",
-                    "app-state.json is corrupt or not a JSON object; refusing to overwrite (see server log)",
-                )
-            }
-        }
-    };
-    deep_merge_masked(&mut merged, &update);
-    // Atomic write: a torn app-state.json loses the API token and every
-    // provider key on restart, so write-then-rename, never in-place.
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = fs::write(&tmp, serde_json::to_string_pretty(&merged).unwrap_or_default()) {
-        let _ = fs::remove_file(&tmp);
-        return err(500, format!("Failed to write app-state.json: {e}"));
+        Err(e) => return err_internal("settings PUT: persist failed", e),
     }
-    if let Err(e) = fs::rename(&tmp, &path) {
-        let _ = fs::remove_file(&tmp);
-        return err(500, format!("Failed to replace app-state.json: {e}"));
-    }
-    invalidate_config_cache();
+    let mut merged = merged_out.unwrap_or_else(|| json!({}));
     ok(mask_secrets(&mut merged).clone())
 }
 
 const SECRET_MASK: &str = "********";
 
+/// Keys whose values are credentials wherever they appear. Beyond the
+/// literal config keys (`apiKey`, `token`, ...) this covers the credential
+/// header names users put into `customHeaders` / `extraHeaders` and the
+/// key names used inside `extraRequestBody` fragments (F-01).
+fn is_sensitive_key(lower: &str) -> bool {
+    matches!(
+        lower,
+        "apikey" | "api_key" | "api-key"
+            | "token" | "accesstoken" | "access_token" | "access-token"
+            | "authorization" | "proxy-authorization"
+            | "x-api-key" | "x-goog-api-key" | "x-subscription-token"
+            | "secret" | "clientsecret" | "client_secret" | "client-secret"
+            | "password" | "privatekey" | "private_key"
+    )
+}
+
 /// Recursively mask values under credential-bearing keys (`apiKey`,
-/// `token`, `accessToken`) for GET responses.
+/// `token`, `accessToken`, plus credential header names per
+/// `is_sensitive_key`) for GET responses.
 fn mask_secrets(value: &mut Value) -> &mut Value {
     match value {
         Value::Object(map) => {
             for (key, item) in map.iter_mut() {
-                let lower = key.to_lowercase();
-                if lower == "apikey" || lower == "token" || lower == "accesstoken" {
+                if is_sensitive_key(&key.to_lowercase()) {
                     if !item.is_null() {
                         *item = Value::String(SECRET_MASK.to_string());
                     }
@@ -1361,6 +1476,26 @@ fn mask_secrets(value: &mut Value) -> &mut Value {
         _ => {}
     }
     value
+}
+
+/// Remove `"********"` leaves from an incoming update so a masked GET
+/// response PUT back wholesale can never persist the mask literal under a
+/// key that did not exist before (F-26).
+fn strip_mask_leaves(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if v.as_str() == Some(SECRET_MASK) {
+                    continue;
+                }
+                out.insert(k.clone(), strip_mask_leaves(v));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(strip_mask_leaves).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Deep merge for PUT /settings semantics:
@@ -1385,13 +1520,12 @@ fn deep_merge_masked(existing: &mut Value, update: &Value) {
             if nested {
                 deep_merge_masked(existing_map.get_mut(key).unwrap(), update_value);
             } else if masked {
-                // keep whatever already exists; if nothing exists, record
-                // the mask so the operator sees it is unset-by-design
-                existing_map
-                    .entry(key.clone())
-                    .or_insert_with(|| Value::String(SECRET_MASK.to_string()));
+                // keep whatever already exists; if the key does not exist
+                // there is nothing to keep - persisting the literal mask
+                // would later be sent to real providers as a credential
+                // and fail there (F-26), so leave it unset
             } else {
-                existing_map.insert(key.clone(), update_value.clone());
+                existing_map.insert(key.clone(), strip_mask_leaves(update_value));
             }
         }
     }
@@ -1434,30 +1568,23 @@ fn handle_create_project(app: &ServerHost, body: &str) -> ApiResponse {
         Ok(project) => project,
         Err(e) => return err(400, e),
     };
-    project_registry::register_project(&req.name, &project.path);
+    project_registry::register_project(name, &project.path);
     project_registry::set_current_project_path(&project.path);
     // Ensure the project has a stable identity BEFORE registering it in
     // app-state — otherwise the registry key falls back to the path and
     // clients can no longer address the project by the returned id.
-    let project_id = match read_project_id(&project.path) {
-        Some(id) => id,
-        None => {
-            let id = uuid::Uuid::new_v4().to_string();
-            let meta_dir = std::path::Path::new(&project.path).join(".llm-wiki");
-            if fs::create_dir_all(&meta_dir).is_ok() {
-                let payload = json!({ "id": id, "name": project.name });
-                let _ = fs::write(
-                    meta_dir.join("project.json"),
-                    serde_json::to_string_pretty(&payload).unwrap_or_default(),
-                );
-            }
-            id
-        }
+    let project_id = match ensure_project_identity(&project.path, name) {
+        Ok(id) => id,
+        Err(e) => return err_internal("project identity", e),
     };
-    persist_project_registration(app, &project_id, name, &project.path);
+    let registered = persist_project_registration(app, &project_id, name, &project.path);
+    if !registered {
+        eprintln!("[api] project {} created on disk but registration did not persist", project_id);
+    }
     invalidate_graph_cache(&project.path);
     ok(json!({
         "ok": true,
+        "registered": registered,
         "project": {
             "id": project_id,
             "name": project.name,
@@ -1482,6 +1609,17 @@ fn handle_set_current_project(app: &ServerHost, body: &str) -> ApiResponse {
     if !root.is_dir() {
         return err(404, format!("Project directory not found: {}", req.path));
     }
+    // Only wiki-shaped directories can be registered. Registering an
+    // arbitrary directory combined with DELETE /projects/{id}
+    // ?deleteFiles=true used to make "switch project" a two-step remote
+    // disk wiper (F-18); requiring a wiki/ root scopes the deletable set
+    // to actual wiki projects (F-54).
+    if !root.join("wiki").is_dir() {
+        return err(
+            400,
+            "Not a wiki project: missing wiki/ directory (scaffold one with POST /api/v1/projects/create)",
+        );
+    }
     let display_name = std::path::Path::new(&req.path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -1491,24 +1629,17 @@ fn handle_set_current_project(app: &ServerHost, body: &str) -> ApiResponse {
     project_registry::set_current_project_path(&req.path);
     // Give dirs without an identity file one (same as projects/create), so
     // the project is addressable by a stable UUID instead of its path.
-    let project_id = match read_project_id(&req.path) {
-        Some(id) => id,
-        None => {
-            let id = uuid::Uuid::new_v4().to_string();
-            let meta_dir = std::path::Path::new(&req.path).join(".llm-wiki");
-            if fs::create_dir_all(&meta_dir).is_ok() {
-                let payload = json!({ "id": id, "name": display_name });
-                let _ = fs::write(
-                    meta_dir.join("project.json"),
-                    serde_json::to_string_pretty(&payload).unwrap_or_default(),
-                );
-            }
-            id
-        }
+    let project_id = match ensure_project_identity(&req.path, &display_name) {
+        Ok(id) => id,
+        Err(e) => return err_internal("project identity", e),
     };
-    persist_project_registration(app, &project_id, &display_name, &req.path);
+    let registered = persist_project_registration(app, &project_id, &display_name, &req.path);
     invalidate_config_cache();
-    ok(json!({ "ok": true, "current": req.path.replace('\\', "/") }))
+    ok(json!({
+        "ok": true,
+        "registered": registered,
+        "current": req.path.replace('\\', "/")
+    }))
 }
 
 /// GET /api/v1/projects/{id}/history?path=<rel> — version list of one
@@ -1557,51 +1688,60 @@ fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> Api
     };
     let params = parse_query(query);
     let delete_files = params.get("deleteFiles").map(|v| v == "true").unwrap_or(false);
+    if delete_files {
+        // Recursive disk removal needs a second, explicit confirmation
+        // naming the directory (F-18): a stale client or mistyped URL must
+        // not be able to remove a project from disk.
+        let dir_name = std::path::Path::new(&project.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if params.get("confirm").map(String::as_str) != Some(dir_name) {
+            return err(
+                400,
+                format!("deleteFiles=true requires confirm={dir_name} (the project directory name)"),
+            );
+        }
+    }
 
     // 1) Remove from app-state.json projectRegistry + recentProjects
-    //    (atomic write-then-rename, preserving every other config key).
+    //    (read-modify-write under the app-state lock, atomic tmp+rename).
     let mut removed_from_store = false;
     if let Some(store) = app.app_state_path() {
-        if let Ok(raw) = fs::read_to_string(&store) {
-            if let Ok(mut merged) = serde_json::from_str::<Value>(&raw) {
-                let path_norm = normalize_path(&project.path);
-                if let Some(map) = merged.as_object_mut() {
-                    if let Some(reg) =
-                        map.get_mut("projectRegistry").and_then(Value::as_object_mut)
-                    {
-                        reg.remove(&project.id);
-                        let stale: Vec<String> = reg
-                            .iter()
-                            .filter(|(_, v)| {
-                                v.get("path").and_then(Value::as_str)
-                                    .map(|p| normalize_path(p)).as_deref() == Some(path_norm.as_str())
-                            })
-                            .map(|(k, _)| k.clone())
-                            .collect();
-                        for k in stale {
-                            reg.remove(&k);
-                        }
-                    }
-                    if let Some(recents) =
-                        map.get_mut("recentProjects").and_then(Value::as_array_mut)
-                    {
-                        recents.retain(|v| {
-                            v.get("path").and_then(Value::as_str)
-                                .map(|p| normalize_path(p)).as_deref() != Some(path_norm.as_str())
-                        });
-                    }
-                }
-                let tmp = store.with_extension("json.tmp");
-                if fs::write(&tmp, serde_json::to_string_pretty(&merged).unwrap_or_default())
-                    .is_ok()
+        let path_norm = normalize_path(&project.path);
+        let result = update_app_state_file(&store, |merged| {
+            if let Some(map) = merged.as_object_mut() {
+                if let Some(reg) =
+                    map.get_mut("projectRegistry").and_then(Value::as_object_mut)
                 {
-                    if fs::rename(&tmp, &store).is_ok() {
-                        removed_from_store = true;
-                        // The 5s app-state cache would otherwise keep the
-                        // removed project resolvable for the next requests.
-                        invalidate_config_cache();
+                    reg.remove(&project.id);
+                    let stale: Vec<String> = reg
+                        .iter()
+                        .filter(|(_, v)| {
+                            v.get("path").and_then(Value::as_str)
+                                .map(|p| normalize_path(p)).as_deref() == Some(path_norm.as_str())
+                        })
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for k in stale {
+                        reg.remove(&k);
                     }
                 }
+                if let Some(recents) =
+                    map.get_mut("recentProjects").and_then(Value::as_array_mut)
+                {
+                    recents.retain(|v| {
+                        v.get("path").and_then(Value::as_str)
+                            .map(|p| normalize_path(p)).as_deref() != Some(path_norm.as_str())
+                    });
+                }
+            }
+            true
+        });
+        match result {
+            Ok(()) => removed_from_store = true,
+            Err(e) => {
+                eprintln!("[api] project deletion: app-state update failed: {e}");
             }
         }
     }
@@ -1617,7 +1757,7 @@ fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> Api
         match fs::remove_dir_all(&project.path) {
             Ok(()) => files_deleted = true,
             Err(e) => {
-                return err(500, format!("Failed to delete project directory: {e}"))
+                return err_internal("project deleteFiles", e)
             }
         }
     }
@@ -1994,8 +2134,10 @@ mod tests {
 
     #[test]
     fn query_parser_decodes_percent_and_plus() {
+        // RFC 3986 (F-19): plus signs are literals in query values; only
+        // %XX escapes decode. Clients must percent-encode literal pluses.
         let parsed = parse_query("path=wiki%2Fhello+world.md&token=a%2Bb");
-        assert_eq!(parsed.get("path").unwrap(), "wiki/hello world.md");
+        assert_eq!(parsed.get("path").unwrap(), "wiki/hello+world.md");
         assert_eq!(parsed.get("token").unwrap(), "a+b");
     }
 
@@ -2004,6 +2146,118 @@ mod tests {
         let content = "前言。这里是关于知识图谱过滤的中文内容。后续说明。";
         let snippet = commands::search::build_snippet(content, "知识图谱");
         assert!(snippet.contains("知识图谱"));
+    }
+
+    // F-01: credential header names inside free-form maps must be masked,
+    // not just the literal apiKey/token config keys.
+    #[test]
+    fn mask_secrets_masks_header_map_values() {
+        let mut v = json!({
+            "llmConfig": {
+                "customHeaders": { "authorization": "sk-live", "content-type": "application/json" },
+                "extraRequestBody": { "api_key": "abc", "temperature": 0.5 }
+            },
+            "embeddingConfig": { "extraHeaders": { "x-api-key": "emb-1" } }
+        });
+        mask_secrets(&mut v);
+        assert_eq!(v["llmConfig"]["customHeaders"]["authorization"], SECRET_MASK);
+        assert_eq!(v["llmConfig"]["extraRequestBody"]["api_key"], SECRET_MASK);
+        assert_eq!(v["embeddingConfig"]["extraHeaders"]["x-api-key"], SECRET_MASK);
+        // non-credential entries stay readable
+        assert_eq!(v["llmConfig"]["customHeaders"]["content-type"], "application/json");
+        assert_eq!(v["llmConfig"]["extraRequestBody"]["temperature"], 0.5);
+    }
+
+    // F-26: PUTting a masked GET response back must never persist the
+    // mask literal - neither at top level nor inside inserted objects.
+    #[test]
+    fn deep_merge_never_persists_the_mask_literal() {
+        let mut base = json!({ "providerConfigs": { "existing": { "apiKey": "real-key" } } });
+        let update = json!({
+            "providerConfigs": {
+                "existing": { "apiKey": SECRET_MASK },
+                "brand-new": { "apiKey": SECRET_MASK, "model": "m1" }
+            },
+            "freshToken": SECRET_MASK,
+            "llmConfig": { "apiKey": SECRET_MASK, "model": "glm" }
+        });
+        deep_merge_masked(&mut base, &update);
+        let raw = serde_json::to_string(&base).unwrap();
+        assert!(!raw.contains(SECRET_MASK), "mask literal leaked: {raw}");
+        // existing key keeps its value; masked unknown keys stay unset;
+        // merged sections still merge their non-secret fields
+        assert_eq!(base["providerConfigs"]["existing"]["apiKey"], "real-key");
+        assert!(base["providerConfigs"]["brand-new"]["apiKey"].is_null());
+        assert_eq!(base["providerConfigs"]["brand-new"]["model"], "m1");
+        assert!(base["freshToken"].is_null());
+        assert_eq!(base["llmConfig"]["model"], "glm");
+        assert!(base["llmConfig"]["apiKey"].is_null());
+    }
+
+    // F-25: concurrent read-modify-write on one app-state file must not
+    // lose updates (each thread writes its own keys; all must survive).
+    #[test]
+    fn concurrent_app_state_writers_do_not_lose_updates() {
+        let dir = std::env::temp_dir().join(format!("appstate-f25-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = std::sync::Arc::new(dir.join("app-state.json"));
+        std::fs::write(shared.as_path(), "{}").unwrap();
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let shared = shared.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..10 {
+                    let key = format!("thread{t}k{i}");
+                    let path = shared.clone();
+                    let res = update_app_state_file(&path, move |merged| {
+                        merged.as_object_mut().unwrap().insert(key.clone(), json!(i));
+                        true
+                    });
+                    assert!(res.is_ok());
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let raw = std::fs::read_to_string(shared.as_path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for t in 0..4 {
+            for i in 0..10 {
+                assert_eq!(v[format!("thread{t}k{i}")], json!(i), "lost update t{t}k{i}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // F-03: the canonical page-id mapping preserves case and scopes to
+    // wiki/*.md; writer, filter and delete now share one implementation.
+    #[test]
+    fn canonical_page_id_preserves_case_and_scopes_to_wiki() {
+        assert_eq!(
+            commands::vectorstore::canonical_page_id("wiki/Notes/Foo.md").as_deref(),
+            Some("Notes/Foo")
+        );
+        assert_eq!(
+            commands::vectorstore::canonical_page_id("wiki//deep/Page.md").as_deref(),
+            Some("deep/Page")
+        );
+        assert_eq!(commands::vectorstore::canonical_page_id("raw/sources/a.pdf"), None);
+        assert_eq!(commands::vectorstore::canonical_page_id("wiki/nope.txt"), None);
+    }
+
+    // F-33: a query longer than the body (title hit, tiny body) must not
+    // underflow the search loop - it simply finds no match.
+    #[test]
+    fn snippet_handles_query_longer_than_content() {
+        let snippet = commands::search::build_snippet("TODO
+", "coal mine safety regulation");
+        assert!(snippet.contains("TODO"));
+        // Multi-byte content shorter than the query must be safe too.
+        let snippet = commands::search::build_snippet("采
+", "煤矿安全规程全文检索");
+        assert!(snippet.contains("采"));
     }
 
     #[test]

@@ -1722,10 +1722,16 @@ pub fn build_snippet(content: &str, query: &str) -> String {
         return String::new();
     }
     let mut match_char = 0;
-    for start in 0..=(lower_content.len() - lower_query.len()) {
-        if lower_content[start..start + lower_query.len()] == lower_query[..] {
-            match_char = start;
-            break;
+    // A query longer than the content simply never matches (e.g. title
+    // scored a hit while the body is a one-liner); saturating_sub keeps
+    // that path defined instead of underflowing into a panic.
+    if lower_query.len() <= lower_content.len() {
+        let max_start = lower_content.len() - lower_query.len();
+        for start in 0..=max_start {
+            if lower_content[start..start + lower_query.len()] == lower_query[..] {
+                match_char = start;
+                break;
+            }
         }
     }
     let char_positions: Vec<usize> = content.char_indices().map(|(idx, _)| idx).collect();
@@ -1771,15 +1777,10 @@ fn file_stem(path: &str) -> String {
 }
 
 fn vector_page_id(path: &str) -> Option<String> {
-    let normalized = normalize_path(path);
-    let wiki_relative = normalized.strip_prefix("wiki/").unwrap_or(&normalized);
-    if wiki_relative.len() < 3
-        || !wiki_relative[wiki_relative.len() - 3..].eq_ignore_ascii_case(".md")
-    {
-        return None;
-    }
-    let id = wiki_relative[..wiki_relative.len() - 3].trim_matches('/');
-    (!id.is_empty()).then(|| id.to_string())
+    // Same canonical mapping the embedding writer uses (F-03); non-wiki
+    // paths have no vectors, so they resolve to None instead of the old
+    // whole-path fallback that could never match a stored id.
+    super::vectorstore::canonical_page_id(&normalize_path(path))
 }
 
 #[cfg(test)]

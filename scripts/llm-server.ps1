@@ -222,8 +222,11 @@ function Start-ServerProcess {
     }
     Set-Content -Path $PidFile -Value $proc.Id | Out-Null
     # Snapshot the effective settings so status/health/stop/logs describe
-    # this instance even after the shell is gone.
-    $Settings | ConvertTo-Json | Set-Content -Path $RuntimePath
+    # this instance even after the shell is gone. The snapshot only needs
+    # to know whether a token was set - never the token itself (F-53).
+    $snapshot = $Settings.Clone()
+    if ($snapshot.Token -ne "") { $snapshot.Token = "<set>" }
+    $snapshot | ConvertTo-Json | Set-Content -Path $RuntimePath
     Write-Host "llm-server started (pid $($proc.Id))" -ForegroundColor Green
     Write-Host "  $(Format-SettingsLine)"
     Write-Host "  API:   $(Get-HealthBaseUrl)/api/v1"

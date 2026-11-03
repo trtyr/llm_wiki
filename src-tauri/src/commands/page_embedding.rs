@@ -280,13 +280,9 @@ fn embedding_fingerprint(revision: &str, config: &SearchEmbeddingConfig) -> Stri
 }
 
 fn vector_page_id(normalized_path: &str) -> Option<String> {
-    let normalized = normalized_path.replace('\\', "/");
-    let relative = normalized.strip_prefix("wiki/")?;
-    if relative.len() < 3 || !relative[relative.len() - 3..].eq_ignore_ascii_case(".md") {
-        return None;
-    }
-    let relative = relative[..relative.len() - 3].trim_matches('/').to_string();
-    (!relative.is_empty()).then_some(relative)
+    // Delegate to the shared canonical implementation so the writer
+    // and the delete/filter paths can never diverge again (F-03).
+    super::vectorstore::canonical_page_id(normalized_path)
 }
 
 async fn remove_legacy_vector_id_if_safe(project_path: &str, page_id: &str) {

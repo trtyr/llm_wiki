@@ -2,6 +2,7 @@
 
 use tiny_http::Method;
 
+use super::params::redact_query_token;
 use super::*;
 
 pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) {
@@ -49,7 +50,7 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
         method,
         Method::Post | Method::Put | Method::Patch | Method::Delete
     ) {
-        eprintln!("[api] {} {}", method, url);
+        eprintln!("[api] {} {}", method, redact_query_token(&url));
     }
     if method == Method::Get && (path == "/docs" || path == "/docs/") {
         // Human-readable API documentation. Same authorization semantics
@@ -62,7 +63,7 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
             return;
         }
         if !is_authorized(&app, query, &headers) {
-            eprintln!("[api] 401 unauthorized {} {}", method, url);
+            eprintln!("[api] 401 unauthorized {} {}", method, redact_query_token(&url));
             respond_error(
                 request,
                 401,

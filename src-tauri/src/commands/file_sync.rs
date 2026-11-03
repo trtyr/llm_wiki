@@ -16,10 +16,10 @@ const MAX_HASH_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RETRY_COUNT: u32 = 3;
 const APP_WRITE_IGNORE_MS: i64 = 4_000;
 const QUEUE_EMIT_EVERY: usize = 25;
-// Native watcher backends can lose events after overflow, sleep/wake, network
-// share reconnects, or long Windows sessions without terminating the watcher.
-// A low-frequency snapshot reconciliation makes the watcher self-healing on
-// every supported platform while keeping steady-state filesystem load small.
+// There is NO filesystem watcher in this build: this module only provides
+// explicit rescans plus the change queue. (The desktop host used to supply
+// a watcher; that layer was removed with the GUI.) The snapshot
+// reconciliation below serves the on-demand rescan path only (F-47).
 const DEFAULT_SOURCE_WATCH_CONFIG_JSON: &str =
     include_str!("source-watch-defaults.json");
 
@@ -94,7 +94,10 @@ pub struct FileChangeRescanResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+// deny_unknown_fields keeps source-watch-defaults.json honest: a key
+// with no struct field fails loudly at startup instead of being a
+// permanently dead config knob (F-46).
 pub struct SourceWatchConfig {
     #[serde(default = "default_source_watch_enabled")]
     enabled: bool,
@@ -189,6 +192,22 @@ fn rescan_core(
         let root = PathBuf::from(project_path);
         let source_watch_config = normalize_source_watch_config(source_watch_config);
         ensure_sync_dir(&root)?;
+        if !source_watch_config.enabled {
+            // The legacy projectFileSyncEnabled=false switch deserializes
+            // into this field and was silently ignored, so disabled
+            // deployments kept syncing anyway (F-46). Honor it.
+            eprintln!("[file_sync] source watch disabled for {project_id}; rescan skipped");
+            let queue = with_queue_lock(&root, || read_queue(&root))?;
+            return Ok(FileChangeRescanResult {
+                queue,
+                changed_tasks: Vec::new(),
+            });
+        }
+        // Crash recovery: tasks left in Processing by a hard kill would
+        // stay there forever (the queue only picks Pending), silently
+        // freezing that file's indexing. Re-arm them at every rescan
+        // entry point (F-44).
+        with_queue_lock(&root, || reset_processing_tasks(&root, &project_id))?;
         if watch_roots_only.unwrap_or(false) {
             enqueue_startup_rescan_changes(&root, &project_id, &source_watch_config)?;
         } else {

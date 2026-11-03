@@ -1,9 +1,6 @@
 {
   "enabled": true,
   "autoIngest": true,
-  "persistExtractedMarkdown": false,
-  "parsingConcurrency": 2,
-  "ingestConcurrency": 1,
   "includeExtensions": [
     "md",
     "mdx",

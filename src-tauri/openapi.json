@@ -62,7 +62,8 @@
           "401": {
             "description": "Unauthorized"
           }
-        }
+        },
+        "description": "Returns the merged app-state configuration (llmConfig, embeddingConfig, searchApiConfig, apiConfig, ...). Values under credential-bearing keys (apiKey, token, accessToken, authorization/x-api-key style header names) are masked as ********. PUTting a masked value back keeps the existing secret (round-trip safe); masked values for unknown keys are dropped instead of persisted."
       },
       "put": {
         "summary": "Merge top-level config sections into app-state.json (unknown keys preserved, null value deletes a key, config cache invalidated immediately)",

@@ -75,6 +75,21 @@ static VECTORSTORE_V2_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::RwL
 /// interpolate page_id into LanceDB filters (`page_id = '...'`).
 /// Format/invisible characters are rejected so visually identical ids cannot
 /// differ only by soft hyphen, zero-width, bidi, tag, or separator characters.
+/// The single source of truth for "wiki/<rel>.md -> page id", shared by
+/// the embedding writer, the retrieval filter and the delete path. Case is
+/// preserved: LanceDB filtering is an exact string match, so lowercasing
+/// here would orphan the vectors of every page whose path contains
+/// uppercase segments (F-03).
+pub fn canonical_page_id(normalized_rel_path: &str) -> Option<String> {
+    let normalized = normalized_rel_path.replace('\\', "/");
+    let relative = normalized.strip_prefix("wiki/")?;
+    if relative.len() < 3 || !relative[relative.len() - 3..].eq_ignore_ascii_case(".md") {
+        return None;
+    }
+    let id = relative[..relative.len() - 3].trim_matches('/');
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 fn validate_page_id_common(page_id: &str) -> Result<(), String> {
     if page_id.is_empty() {
         return Err("Invalid page_id: empty or too long".to_string());
