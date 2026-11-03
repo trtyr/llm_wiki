@@ -4,7 +4,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -756,64 +756,9 @@ fn write_wiki_page_with_activity(
 }
 
 fn atomic_replace_file(path: &Path, content: &[u8]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Failed to resolve wiki page parent directory".to_string())?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "wiki.write_page path must be valid UTF-8".to_string())?;
-    let nonce = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp = parent.join(format!(
-        ".{file_name}.llm-wiki-{}-{nonce}.tmp",
-        std::process::id()
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|err| format!("Failed to create wiki page temp file: {err}"))?;
-    if let Err(err) = file.write_all(content).and_then(|_| file.sync_all()) {
-        let _ = fs::remove_file(&temp);
-        return Err(format!("Failed to write wiki page temp file: {err}"));
-    }
-    drop(file);
-
-    #[cfg(not(windows))]
-    {
-        if let Err(err) = fs::rename(&temp, path) {
-            let _ = fs::remove_file(&temp);
-            return Err(format!("Failed to replace wiki page: {err}"));
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        let backup = parent.join(format!(
-            ".{file_name}.llm-wiki-{}-{nonce}.bak",
-            std::process::id()
-        ));
-        let had_target = path.exists();
-        if had_target {
-            fs::rename(path, &backup)
-                .map_err(|err| format!("Failed to stage existing wiki page: {err}"))?;
-        }
-        if let Err(err) = fs::rename(&temp, path) {
-            if had_target {
-                let _ = fs::rename(&backup, path);
-            }
-            let _ = fs::remove_file(&temp);
-            return Err(format!("Failed to replace wiki page: {err}"));
-        }
-        if had_target {
-            let _ = fs::remove_file(backup);
-        }
-    }
-
-    Ok(())
+    // Shared implementation in commands::fs - identical semantics, one
+    // place to maintain (F-31/F-37 unification).
+    crate::commands::fs::replace_file_atomically(path, content)
 }
 
 fn write_workspace_file(
@@ -2577,10 +2522,26 @@ pub fn search_sources(
                 | "epub"
                 | "mobi"
         ) {
-            let Some(content) = crate::commands::fs::read_preprocessed_cache(entry.path()) else {
-                continue;
-            };
-            content
+            // Binary sources are searched through their extracted-text
+            // cache. The cache used to have no writer, so every PDF/
+            // DOCX/... was silently unsearchable (F-36); generate it on
+            // first use now.
+            match crate::commands::fs::read_preprocessed_cache(entry.path()) {
+                Some(content) => content,
+                None => {
+                    match crate::commands::fs::preprocess_file_sync(entry.path()) {
+                        Ok(text) if text != "no preprocessing needed" => text,
+                        Ok(_) => continue,
+                        Err(err) => {
+                            eprintln!(
+                                "[source.search] preprocessing {} failed: {err}",
+                                entry.path().display()
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
         } else {
             continue;
         };
@@ -2643,7 +2604,15 @@ fn safe_project_join(project_path: &str, rel: &str) -> Result<PathBuf, String> {
     if rel_path.is_absolute()
         || rel_path
             .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+            // RootDir too (F-32): on Windows Path::new("/x").is_absolute()
+            // is false, but root.join("/x") replaces everything after the
+            // drive letter and escapes the project.
+            .any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::Prefix(_) | Component::RootDir
+                )
+            })
     {
         return Err("path must be project-relative".to_string());
     }

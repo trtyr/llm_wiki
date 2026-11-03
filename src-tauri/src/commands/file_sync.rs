@@ -57,8 +57,9 @@ pub enum FileChangeStatus {
     Processing,
     Done,
     Failed,
-    Superseded,
 }
+// (Superseded removed, F-45: it was never constructed - a state-machine
+// gear that only misled readers into assuming a replace-on-rescan path.)
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1015,33 +1016,10 @@ fn write_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
     }
     let text =
         serde_json::to_string_pretty(value).map_err(|e| format!("JSON encode failed: {e}"))?;
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file-sync.json".to_string());
-    let tmp_path = path.with_file_name(format!(
-        ".{file_name}.{}.tmp",
-        chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or_else(now_ms)
-    ));
-    fs::write(&tmp_path, text)
-        .map_err(|e| format!("Failed to write '{}': {e}", tmp_path.display()))?;
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            fs::remove_file(&path)
-                .map_err(|e| format!("Failed to replace '{}': {e}", path.display()))?;
-        }
-    }
-    fs::rename(&tmp_path, &path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        format!(
-            "Failed to move '{}' to '{}': {e}",
-            tmp_path.display(),
-            path.display()
-        )
-    })
+    // Shared atomic replace (F-31): the Windows branch used to delete
+    // the old file before renaming, leaving a crash window where the
+    // sync state vanished entirely.
+    crate::commands::fs::replace_file_atomically(&path, text.as_bytes())
 }
 
 fn stable_path_hash(path: &str) -> String {

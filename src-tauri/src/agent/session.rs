@@ -176,6 +176,45 @@ fn load_session(project_path: &str, session_id: &str) -> Option<AgentSession> {
     }
 }
 
+/// Bound the on-disk session directory: keep the newest
+/// `MAX_PERSISTED_SESSIONS` files, delete older ones (F-06). Without this
+/// the directory grows without limit and every `list_sessions` call
+/// re-parses all of it.
+const MAX_PERSISTED_SESSIONS: usize = 200;
+
+fn prune_sessions(project_path: &str) {
+    let dir = Path::new(project_path)
+        .join(".llm-wiki")
+        .join("agent-sessions");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+        .filter_map(|entry| {
+            entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .map(|mtime| (mtime, entry.path()))
+        })
+        .collect();
+    if files.len() <= MAX_PERSISTED_SESSIONS {
+        return;
+    }
+    files.sort();
+    let excess = files.len() - MAX_PERSISTED_SESSIONS;
+    for (_, path) in files.iter().take(excess) {
+        if let Err(err) = fs::remove_file(path) {
+            eprintln!("[session] prune failed for {}: {err}", path.display());
+        }
+    }
+    eprintln!(
+        "[session] pruned {excess} old session files (cap {MAX_PERSISTED_SESSIONS})"
+    );
+}
+
 fn save_session(project_path: &str, session: &AgentSession) -> Result<(), String> {
     let path = session_file(project_path, &session.session_id)
         .ok_or_else(|| "Invalid Agent session id".to_string())?;
@@ -192,6 +231,7 @@ fn save_session(project_path: &str, session: &AgentSession) -> Result<(), String
         let _ = fs::remove_file(&tmp);
         return Err(format!("Failed to replace session file: {err}"));
     }
+    prune_sessions(project_path);
     Ok(())
 }
 
@@ -215,18 +255,17 @@ fn sanitize_session_id(session_id: &str) -> Option<String> {
     {
         return None;
     }
-    Some(
-        trimmed
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect(),
-    )
+    // F-40: the id is both the filename and the identity stored inside the
+    // file. Silently rewriting "chat 1" to "chat_1" used to make two
+    // different sessions collide into one file (or serve the wrong one on
+    // read), so invalid ids are rejected instead of renamed.
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -340,6 +379,33 @@ mod tests {
     fn session_ids_reject_path_traversal() {
         assert!(session_file("/tmp/project", "../secret").is_none());
         assert!(session_file("/tmp/project", "safe-id").is_some());
+    }
+
+    // F-40: ids that would previously be silently renamed are now rejected
+    #[test]
+    fn session_ids_with_unsupported_characters_are_rejected() {
+        assert!(session_file("/tmp/project", "chat 1").is_none());
+        assert!(session_file("/tmp/project", "chat_1").is_some());
+        assert!(session_file("/tmp/project", "id:colon").is_none());
+        assert!(session_file("/tmp/project", "safe-id.1").is_some());
+    }
+
+    // F-06: session files beyond the cap are pruned
+    #[test]
+    fn prune_sessions_caps_the_session_directory() {
+        let project = temp_project("prune");
+        let dir = project
+            .join(".llm-wiki")
+            .join("agent-sessions");
+        fs::create_dir_all(&dir).unwrap();
+        for idx in 0..(MAX_PERSISTED_SESSIONS + 10) {
+            let file = dir.join(format!("sess-{idx:04}.json"));
+            fs::write(&file, "{}").unwrap();
+        }
+        prune_sessions(project.to_string_lossy().as_ref());
+        let remaining = fs::read_dir(&dir).unwrap().filter_map(Result::ok).count();
+        assert_eq!(remaining, MAX_PERSISTED_SESSIONS);
+        let _ = fs::remove_dir_all(&project);
     }
 
     #[test]

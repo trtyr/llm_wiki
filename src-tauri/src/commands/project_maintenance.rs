@@ -159,12 +159,12 @@ fn export_project_archive_inner(project_path: String, destination: String) -> Re
         .canonicalize()
         .map_err(|e| e.to_string())?;
     // Use the same canonical destination that passed containment validation.
-    // Reusing the unresolved input would separate the checked path from the
-    // path opened for writing and retain avoidable traversal/TOCTOU surface.
     let output = resolve_export_destination(&root, &PathBuf::from(destination))?;
-    let file = File::create(&output).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    // Enumerate first and enforce the same limits as the import side
+    // (F-38); previously the destination was truncated before the walk, so
+    // any unreadable file left a corrupt, half-empty archive behind.
+    let mut entries: Vec<(PathBuf, String)> = Vec::new();
+    let mut total_bytes: u64 = 0;
     for entry in WalkDir::new(&root).follow_links(false) {
         let entry = entry.map_err(|error| format!("Failed to enumerate project: {error}"))?;
         if entry.path() == root || entry.file_type().is_symlink() {
@@ -176,18 +176,51 @@ fn export_project_archive_inner(project_path: String, destination: String) -> Re
             .map_err(|e| e.to_string())?;
         let name = rel.to_string_lossy().replace('\\', "/");
         if entry.file_type().is_dir() {
-            zip.add_directory(format!("{name}/"), options)
-                .map_err(|e| e.to_string())?;
+            entries.push((entry.path().to_path_buf(), format!("{name}/")));
+        } else {
+            total_bytes += entry.metadata().map_err(|e| e.to_string())?.len();
+            entries.push((entry.path().to_path_buf(), name));
+        }
+        if entries.len() > MAX_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "Project too large to export: more than {MAX_ARCHIVE_ENTRIES} entries"
+            ));
+        }
+    }
+    if total_bytes > MAX_ARCHIVE_BYTES {
+        return Err(format!(
+            "Project too large to export: {total_bytes} bytes exceeds the {MAX_ARCHIVE_BYTES} byte limit"
+        ));
+    }
+    // Write to a temp file, then promote atomically (F-38).
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = output.with_file_name(format!(
+        ".{}.llm-wiki-{}-{nonce}.tmp",
+        output
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("export"),
+        std::process::id()
+    ));
+    let file = File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (path, name) in &entries {
+        if name.ends_with('/') {
+            zip.add_directory(name, options).map_err(|e| e.to_string())?;
         } else {
             zip.start_file(name, options).map_err(|e| e.to_string())?;
-            let mut source = File::open(entry.path()).map_err(|e| e.to_string())?;
+            let mut source = File::open(path).map_err(|e| e.to_string())?;
             std::io::copy(&mut source, &mut zip).map_err(|e| e.to_string())?;
         }
     }
     zip.finish().map_err(|e| e.to_string())?;
+    crate::commands::fs::promote_temp_file(&tmp, &output).map_err(|e| e.to_string())?;
     Ok(())
 }
-
 pub async fn import_project_archive(
     archive_path: String,
     destination: String,
@@ -288,7 +321,15 @@ pub async fn rebuild_wiki_index(project_path: String) -> Result<RebuildIndexResu
         .map_err(|error| format!("Index rebuild task failed: {error}"))?
 }
 
+// Two concurrent rebuilds (or a rebuild racing a rescan write) used to
+// fight over one deterministic tmp name; serialize rebuilds process-wide
+// and write via the shared atomic replace (F-37).
+static REBUILD_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn rebuild_wiki_index_inner(project_path: String) -> Result<RebuildIndexResult, String> {
+    let _guard = REBUILD_INDEX_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let wiki = PathBuf::from(project_path).join("wiki");
     let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for entry in WalkDir::new(&wiki).follow_links(false) {
@@ -334,17 +375,10 @@ fn rebuild_wiki_index_inner(project_path: String) -> Result<RebuildIndexResult, 
         output.push('\n');
     }
     let index_path = wiki.join("index.md");
-    let temporary_path = wiki.join(".index.md.rebuild.tmp");
-    let mut file = File::create(&temporary_path).map_err(|e| e.to_string())?;
-    file.write_all(output.as_bytes())
+    // Atomic replace (F-37): no deterministic tmp name, no Windows
+    // remove-then-rename crash window on wiki/index.md.
+    crate::commands::fs::replace_file_atomically(&index_path, output.as_bytes())
         .map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    drop(file);
-    #[cfg(windows)]
-    if index_path.exists() {
-        fs::remove_file(&index_path).map_err(|e| e.to_string())?;
-    }
-    fs::rename(&temporary_path, &index_path).map_err(|e| e.to_string())?;
     Ok(RebuildIndexResult {
         pages: count,
         groups: groups.len(),

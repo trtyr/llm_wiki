@@ -444,6 +444,65 @@ fn handle_delete_file(app: &ServerHost, project_id: &str, query: &str) -> ApiRes
     ok(body)
 }
 
+/// GET /api/v1/projects/{id}/sources/queue - inspect the change queue
+/// (previously implemented but unreachable: no route exposed it, F-45).
+fn handle_sources_queue(app: &ServerHost, project_id: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    match commands::file_sync::get_file_change_queue(project.path.clone()) {
+        Ok(queue) => ok(json!({
+            "ok": true,
+            "projectId": project.id,
+            "queue": queue,
+        })),
+        Err(e) => err_internal("sources queue", e),
+    }
+}
+
+/// POST /api/v1/projects/{id}/sources/queue/{taskId}/retry - re-arm a
+/// failed task and process it immediately (F-45).
+fn handle_sources_queue_retry(app: &ServerHost, project_id: &str, task_id: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    match commands::file_sync::retry_file_change_task(
+        project.id.clone(),
+        project.path.clone(),
+        task_id.to_string(),
+    ) {
+        Ok(queue) => ok(json!({
+            "ok": true,
+            "projectId": project.id,
+            "queue": queue,
+        })),
+        Err(e) => err_internal("sources queue retry", e),
+    }
+}
+
+/// DELETE /api/v1/projects/{id}/sources/queue/{taskId} - drop a failed
+/// task from the queue so it stops accumulating (F-45).
+fn handle_sources_queue_ignore(app: &ServerHost, project_id: &str, task_id: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    match commands::file_sync::ignore_file_change_task(
+        project.id.clone(),
+        project.path.clone(),
+        task_id.to_string(),
+    ) {
+        Ok(queue) => ok(json!({
+            "ok": true,
+            "projectId": project.id,
+            "queue": queue,
+        })),
+        Err(e) => err_internal("sources queue ignore", e),
+    }
+}
+
 fn handle_files(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse {
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,

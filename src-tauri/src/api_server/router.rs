@@ -262,6 +262,15 @@ fn handle_request(
         }
         (&Method::Post, ["projects", project_id, "search"]) => handle_search(app, project_id, body),
         (&Method::Get, ["projects", project_id, "graph"]) => handle_graph(app, project_id, query),
+        (&Method::Get, ["projects", project_id, "sources", "queue"]) => {
+            handle_sources_queue(app, project_id)
+        }
+        (&Method::Post, ["projects", project_id, "sources", "queue", task_id, "retry"]) => {
+            handle_sources_queue_retry(app, project_id, task_id)
+        }
+        (&Method::Delete, ["projects", project_id, "sources", "queue", task_id]) => {
+            handle_sources_queue_ignore(app, project_id, task_id)
+        }
         (&Method::Post, ["projects", project_id, "sources", "rescan"]) => {
             handle_rescan(app, project_id)
         }

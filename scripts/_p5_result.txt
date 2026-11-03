@@ -1,5 +1,0 @@
-cors.rs: extension origins removed
-router.rs /docs kill-switch
-lib.rs doc fixed
-project_registry doc updated
-invalidate comment updated

@@ -1,4 +1,0 @@
-cancel.rs: 2 lock unwrap -> poisoned recovery
-lib.rs doc comment updated
-invalidate_config_cache comment/allow fixed
-config example cleaned

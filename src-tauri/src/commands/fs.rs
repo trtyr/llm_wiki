@@ -128,31 +128,38 @@ pub async fn read_file(path: String, extract_images: Option<bool>) -> Result<Str
     .map_err(|e| format!("read_file blocking task join error: {e}"))?
 }
 
+/// Pre-process a file and cache the extracted text. Synchronous core so
+/// `source.search` can generate a missing cache inline (F-36).
+pub(crate) fn preprocess_file_sync(path: &Path) -> Result<String, String> {
+    run_guarded("preprocess_file", || {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let text = match ext.as_str() {
+            "pdf" => extract_pdf_text(&path.to_string_lossy(), false)?,
+            "org" => extract_org_text(&path.to_string_lossy())?,
+            e if OFFICE_EXTS.contains(&e) => {
+                extract_office_text(&path.to_string_lossy(), e)?
+            }
+            e if EBOOK_EXTS.contains(&e) => {
+                crate::commands::ebook::extract_ebook_text(&path.to_string_lossy(), e)?
+            }
+            _ => return Ok("no preprocessing needed".to_string()),
+        };
+
+        write_cache(path, &text)?;
+        Ok(text)
+    })
+}
+
 /// Pre-process a file and cache the extracted text.
 pub async fn preprocess_file(path: String) -> Result<String, String> {
     // See `read_file` above for why `spawn_blocking` is required.
     tokio::task::spawn_blocking(move || {
-        run_guarded("preprocess_file", || {
-            let p = Path::new(&path);
-            let ext = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-
-            let text = match ext.as_str() {
-                "pdf" => extract_pdf_text(&path, false)?,
-                "org" => extract_org_text(&path)?,
-                e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e)?,
-                e if EBOOK_EXTS.contains(&e) => {
-                    crate::commands::ebook::extract_ebook_text(&path, e)?
-                }
-                _ => return Ok("no preprocessing needed".to_string()),
-            };
-
-            write_cache(p, &text)?;
-            Ok(text)
-        })
+        preprocess_file_sync(Path::new(&path))
     })
     .await
     .map_err(|e| format!("preprocess_file blocking task join error: {e}"))?
@@ -685,6 +692,15 @@ fn extract_doc_with_office_oxide(path: &str) -> Result<String, String> {
 
 /// Extract DOCX using docx-rs library for proper structural parsing.
 fn extract_docx_with_library(path: &str) -> Result<String, String> {
+    // Size gate before slurping (F-34).
+    let meta = fs::metadata(path).map_err(|e| format!("Failed to stat docx: {e}"))?;
+    if meta.len() > MAX_OFFICE_ZIP_EXPANDED_BYTES {
+        return Err(format!(
+            "docx too large for compatibility parsing ({} > {} bytes)",
+            meta.len(),
+            MAX_OFFICE_ZIP_EXPANDED_BYTES
+        ));
+    }
     let bytes = fs::read(path).map_err(|e| format!("Failed to read DOCX '{}': {}", path, e))?;
     let docx = docx_rs::read_docx(&bytes)
         .map_err(|e| format!("Failed to parse DOCX '{}': {:?}", path, e))?;
@@ -816,21 +832,108 @@ fn extract_docx_with_library(path: &str) -> Result<String, String> {
     }
 }
 
+// Office compatibility-path ZIP limits (F-34), mirroring the EPUB
+// constants in commands/ebook.rs: the fallback parser must not become
+// the weakest link a malicious archive can funnel gigabytes into.
+const MAX_OFFICE_ZIP_ENTRY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_OFFICE_ZIP_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
+
 fn read_zip_file(archive: &mut zip::ZipArchive<fs::File>, name: &str) -> Option<String> {
     let mut file = archive.by_name(name).ok()?;
+    if file.size() as usize > MAX_OFFICE_ZIP_ENTRY_BYTES {
+        eprintln!(
+            "[office] zip entry '{name}' too large ({} bytes); refusing to read",
+            file.size()
+        );
+        return None;
+    }
     let mut content = String::new();
-    file.read_to_string(&mut content).ok()?;
+    if file.read_to_string(&mut content).is_err() {
+        return None;
+    }
     Some(content)
 }
 
+
 fn decode_xml_entities(text: &str) -> String {
-    text.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#10;", "\n")
-        .replace("&#13;", "")
+    // Single pass, &amp; resolved LAST (F-39): the old replace chain ran
+    // &amp; first, so literal "&lt;" encoded as "&amp;lt;" collapsed into
+    // "<". Numeric entities beyond LF/CR now decode too (Word/PPT emit
+    // &#8217;, &#160;, &#x2014; ...).
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            // copy the whole next UTF-8 char
+            let ch_len = utf8_len(bytes[i]);
+            out.push_str(&text[i..i + ch_len]);
+            i += ch_len;
+            continue;
+        }
+        let Some(semi) = text[i..].find(';') else {
+            out.push('&');
+            i += 1;
+            continue;
+        };
+        let entity = &text[i + 1..i + semi];
+        let replacement = match entity {
+            "lt" => Some('<'.to_string()),
+            "gt" => Some('>'.to_string()),
+            "quot" => Some('"'.to_string()),
+            "apos" => Some('\''.to_string()),
+            "amp" => None, // resolved last: treat as literal for now
+            _ => {
+                if let Some(hex) = entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                {
+                    u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                } else if let Some(dec) = entity.strip_prefix('#') {
+                    dec.parse::<u32>().ok().and_then(char::from_u32)
+                } else {
+                    None
+                }
+                .map(|c| c.to_string())
+            }
+        };
+        match replacement {
+            Some(mut decoded) => {
+                if decoded == "&" {
+                    // a decoded & could itself start another entity only if
+                    // the source contained "&amp;" followed by entity text;
+                    // emit it raw - it is data, not markup (single pass)
+                    decoded = "&".to_string();
+                }
+                out.push_str(&decoded);
+                i += semi + 1;
+            }
+            None => {
+                if entity == "amp" {
+                    out.push('&');
+                    i += semi + 1;
+                } else {
+                    // unknown or malformed entity: keep verbatim
+                    out.push('&');
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn utf8_len(first_byte: u8) -> usize {
+    match first_byte {
+        0..=127 => 1,
+        192..=223 => 2,
+        224..=239 => 3,
+        240..=247 => 4,
+        _ => 1,
+    }
 }
 
 /// Extract DOCX to Markdown preserving headings, paragraphs, lists, tables, bold/italic.
@@ -1237,6 +1340,123 @@ fn extract_odf_text(archive: &mut zip::ZipArchive<fs::File>) -> Result<String, S
     }
 }
 
+/// Shared atomic file replacement: unique temp name + fsync + rename, and
+/// on Windows the old file is staged to a `.bak` first so a crash between
+/// the two renames still leaves either the old or the new content (never a
+/// missing or half-written file). The single implementation behind wiki
+/// page writes, history restores, sync-state saves and index rebuilds
+/// (F-05/F-31/F-35/F-37).
+/// Move a fully written temp file over `target`, keeping the old file
+/// recoverable on Windows (stage to .bak first, roll back on failure).
+/// The shared second half of `replace_file_atomically`; also used by
+/// streaming writers (project export) whose payload never fits memory
+/// (F-38).
+pub(crate) fn promote_temp_file(tmp: &Path, target: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let parent = target
+            .parent()
+            .ok_or_else(|| "Failed to resolve parent directory".to_string())?;
+        let file_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "Path must be valid UTF-8".to_string())?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let backup = parent.join(format!(
+            ".{file_name}.llm-wiki-{}-{nonce}.bak",
+            std::process::id()
+        ));
+        let had_target = target.exists();
+        if had_target {
+            fs::rename(target, &backup)
+                .map_err(|err| format!("Failed to stage existing file: {err}"))?;
+        }
+        if let Err(err) = fs::rename(tmp, target) {
+            if had_target {
+                let _ = fs::rename(&backup, target);
+            }
+            let _ = fs::remove_file(tmp);
+            return Err(format!("Failed to replace file: {err}"));
+        }
+        if had_target {
+            let _ = fs::remove_file(backup);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Err(err) = fs::rename(tmp, target) {
+            let _ = fs::remove_file(tmp);
+            return Err(format!("Failed to replace file: {err}"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn replace_file_atomically(path: &Path, content: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Failed to resolve parent directory".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Path must be valid UTF-8".to_string())?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".{file_name}.llm-wiki-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|err| format!("Failed to create temp file: {err}"))?;
+    if let Err(err) = file.write_all(content).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("Failed to write temp file: {err}"));
+    }
+    drop(file);
+
+    #[cfg(not(windows))]
+    {
+        if let Err(err) = fs::rename(&temp, path) {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Failed to replace file: {err}"));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let backup = parent.join(format!(
+            ".{file_name}.llm-wiki-{}-{nonce}.bak",
+            std::process::id()
+        ));
+        let had_target = path.exists();
+        if had_target {
+            fs::rename(path, &backup)
+                .map_err(|err| format!("Failed to stage existing file: {err}"))?;
+        }
+        if let Err(err) = fs::rename(&temp, path) {
+            if had_target {
+                let _ = fs::rename(&backup, path);
+            }
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Failed to replace file: {err}"));
+        }
+        if had_target {
+            let _ = fs::remove_file(backup);
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn write_file(path: String, contents: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         run_guarded("write_file", || {
@@ -1252,7 +1472,9 @@ pub async fn write_file(path: String, contents: String) -> Result<(), String> {
                 "baseline",
                 "before.ui.write_file",
             );
-            fs::write(&path, contents)
+            // Atomic replace (F-35): a killed process or full disk must
+            // not leave a truncated file behind.
+            replace_file_atomically(p, contents.as_bytes())
                 .map_err(|e| format!("Failed to write file '{}': {}", path, e))?;
             crate::commands::file_history::record_file_version(p, "human", "ui.write_file");
             file_sync::mark_app_write_path(p);
@@ -1278,8 +1500,21 @@ pub async fn write_file_base64(path: String, base64: String) -> Result<(), Strin
                     .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path, e))?;
             }
             file_sync::mark_app_write_path(p);
-            fs::write(&path, bytes)
+            // Atomic replace + history snapshots (F-35): binary writes
+            // used to bypass file history entirely and were the one
+            // non-atomic writer left.
+            crate::commands::file_history::record_file_version(
+                p,
+                "baseline",
+                "before.ui.write_file_base64",
+            );
+            replace_file_atomically(p, &bytes)
                 .map_err(|e| format!("Failed to write binary file '{}': {}", path, e))?;
+            crate::commands::file_history::record_file_version(
+                p,
+                "human",
+                "ui.write_file_base64",
+            );
             file_sync::mark_app_write_path(p);
             Ok(())
         })
@@ -2401,7 +2636,20 @@ mod tests {
         assert!(result.unwrap_err().contains("Failed to parse DOC"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[test]
+    fn xml_entities_decode_in_single_pass_amp_last() {
+        // F-39: &amp;lt; must render as the literal text "&lt;", not "<"
+        assert_eq!(decode_xml_entities("&amp;lt;"), "&lt;");
+        assert_eq!(decode_xml_entities("a &amp; b &lt; c"), "a & b < c");
+        // numeric entities beyond LF/CR
+        assert_eq!(decode_xml_entities("&#8217;"), "\u{2019}");
+        assert_eq!(decode_xml_entities("&#x2014;"), "\u{2014}");
+        assert_eq!(decode_xml_entities("&#160;"), "\u{a0}");
+        // unknown entity stays verbatim
+        assert_eq!(decode_xml_entities("&nbsp;"), "&nbsp;");
+        assert_eq!(decode_xml_entities("plain"), "plain");
+    }
+
     async fn write_file_base64_writes_decoded_binary_bytes() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(

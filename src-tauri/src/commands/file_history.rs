@@ -457,7 +457,11 @@ pub async fn restore_file_history(
                 fs::write(&store_path, updated).map_err(|e| e.to_string())?;
                 prune_history_store(&root, &store_path);
             }
-            fs::write(&file, &entry.content).map_err(|e| e.to_string())?;
+            // Restore is the user's last resort after losing content; a
+            // torn half-file here is unforgivable, so use the shared
+            // atomic replace (F-05).
+            crate::commands::fs::replace_file_atomically(&file, entry.content.as_bytes())
+                .map_err(|e| e.to_string())?;
             entry.content
         };
         Ok(content)

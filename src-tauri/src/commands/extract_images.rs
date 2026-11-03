@@ -15,13 +15,8 @@
 //! ordering, same `index` per image), so the dedup cache in Phase 3
 //! can key purely on the SHA-256 of `data_base64`.
 
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 const MIN_FULL_PAGE_SKIP_RATIO: f32 = 0.5;
 const MAX_FULL_PAGE_SKIP_RATIO: f32 = 1.0;
@@ -70,34 +65,6 @@ impl Default for ExtractOptions {
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExtractedImage {
-    /// 1-based index in document order. Stable across re-extractions.
-    /// Stability assumes the same extraction options; changing filters can
-    /// shift subsequent indices.
-    /// Used as the filename suffix when the caller writes images to
-    /// `wiki/media/<slug>/img-<index>.<ext>`.
-    pub index: u32,
-    /// MIME type ("image/png" / "image/jpeg" / etc.). PNG for any
-    /// image we re-encode (PDFs always); pass-through for office docs
-    /// where the original bytes are already in a web-friendly format.
-    pub mime_type: String,
-    /// 1-based page number for PDFs / 1-based slide number for PPTX.
-    /// `None` for DOCX (which doesn't have a per-image page concept
-    /// at extraction time without parsing document.xml position
-    /// markers, which is more work than this phase needs).
-    pub page: Option<u32>,
-    pub width: u32,
-    pub height: u32,
-    /// Image bytes, base64-encoded. JSON IPC can't carry raw binary.
-    pub data_base64: String,
-    /// SHA-256 hex of the *encoded* bytes (same encoding as
-    /// `data_base64` decodes to). Used by the Phase 3 caption cache
-    /// to dedupe identical images across files.
-    pub sha256: String,
-}
-
 fn is_full_page_image_bounds(
     object_width: f32,
     object_height: f32,
@@ -112,9 +79,33 @@ fn is_full_page_image_bounds(
     object_width / page_width >= ratio && object_height / page_height >= ratio
 }
 
+
+
 fn has_meaningful_page_text(text: &str, min_chars: usize) -> bool {
     text.chars().filter(|c| !c.is_whitespace()).count() >= min_chars
 }
+
+fn should_skip_full_page_pdf_image(
+    object: &pdfium_render::prelude::PdfPageObject<'_>,
+    page_width: f32,
+    page_height: f32,
+    page_has_meaningful_text: bool,
+    options: &ExtractOptions,
+) -> bool {
+    should_skip_full_page_image_decision(
+        options.skip_full_page_images,
+        page_has_meaningful_text,
+        is_full_page_pdf_image_object(
+            object,
+            page_width,
+            page_height,
+            options.full_page_coverage_ratio,
+        ),
+    )
+}
+
+// ── PDF (pdfium) ────────────────────────────────────────────────────────
+
 
 fn is_full_page_pdf_image_object(
     object: &pdfium_render::prelude::PdfPageObject<'_>,
@@ -138,16 +129,6 @@ fn is_full_page_pdf_image_object(
         .unwrap_or(false)
 }
 
-fn pdf_page_has_meaningful_text(
-    page: &pdfium_render::prelude::PdfPage<'_>,
-    min_chars: usize,
-) -> bool {
-    // Image-only extraction should not fail just because text extraction fails;
-    // keeping the image is the safer fallback.
-    page.text()
-        .map(|text| has_meaningful_page_text(&text.all(), min_chars))
-        .unwrap_or(false)
-}
 
 fn should_skip_full_page_image_decision(
     skip_enabled: bool,
@@ -157,26 +138,6 @@ fn should_skip_full_page_image_decision(
     skip_enabled && page_has_meaningful_text && image_is_full_page
 }
 
-fn should_skip_full_page_pdf_image(
-    object: &pdfium_render::prelude::PdfPageObject<'_>,
-    page_width: f32,
-    page_height: f32,
-    page_has_meaningful_text: bool,
-    options: &ExtractOptions,
-) -> bool {
-    should_skip_full_page_image_decision(
-        options.skip_full_page_images,
-        page_has_meaningful_text,
-        is_full_page_pdf_image_object(
-            object,
-            page_width,
-            page_height,
-            options.full_page_coverage_ratio,
-        ),
-    )
-}
-
-// ── PDF (pdfium) ────────────────────────────────────────────────────────
 
 /// Combined PDF text + image extraction in a single pdfium session.
 ///
@@ -338,345 +299,11 @@ pub fn extract_pdf_markdown(
     Ok(out)
 }
 
-/// Iterate every PDF page, extract every embedded raster image, and
-/// re-encode each to PNG. Vector content (paths, glyph outlines) is
-/// NOT extracted here — that's a Phase 1.5 follow-up if needed (would
-/// involve rendering the entire page to a bitmap as a fallback).
-pub fn extract_pdf_images(
-    path: &str,
-    options: &ExtractOptions,
-) -> Result<Vec<ExtractedImage>, String> {
-    use pdfium_render::prelude::*;
-
-    // Hold the global PDFium lock for the entire call. The C library
-    // is NOT safe for concurrent access — see `lock_pdfium` in fs.rs
-    // for the full rationale. Held for the whole document lifetime so
-    // page iteration doesn't race a concurrent `load_pdf_from_file`
-    // on a different worker thread.
-    let _guard = crate::commands::fs::lock_pdfium();
-    let pdfium = crate::commands::fs::pdfium()?;
-    let doc = pdfium
-        .load_pdf_from_file(path, None)
-        .map_err(|e| format!("Failed to open PDF '{path}': {e}"))?;
-
-    let mut out: Vec<ExtractedImage> = Vec::new();
-    let mut idx: u32 = 0;
-
-    'pages: for (page_idx, page) in doc.pages().iter().enumerate() {
-        let mut page_has_meaningful_text: Option<bool> = None;
-        for object in page.objects().iter() {
-            // Only image objects. Path / text / shading / form / etc.
-            // are all skipped — we don't try to rasterize vector charts
-            // in this phase.
-            let image = match object.as_image_object() {
-                Some(img) => img,
-                None => continue,
-            };
-            let should_skip = if options.skip_full_page_images {
-                let has_meaningful_text = *page_has_meaningful_text.get_or_insert_with(|| {
-                    pdf_page_has_meaningful_text(&page, options.full_page_min_text_chars)
-                });
-                should_skip_full_page_pdf_image(
-                    &object,
-                    page.width().value,
-                    page.height().value,
-                    has_meaningful_text,
-                    options,
-                )
-            } else {
-                false
-            };
-            if should_skip {
-                continue;
-            }
-
-            // get_raw_image returns an `image::DynamicImage`. PDFium
-            // can fail per-image on a corrupt embed; we log + skip
-            // rather than aborting the whole document.
-            let dyn_img = match image.get_raw_image() {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!(
-                        "[extract_pdf_images] page {} image read failed: {e}",
-                        page_idx + 1
-                    );
-                    continue;
-                }
-            };
-
-            let width = dyn_img.width();
-            let height = dyn_img.height();
-            if width < options.min_width || height < options.min_height {
-                continue;
-            }
-
-            // Re-encode to PNG. We don't try to preserve the source
-            // codec — PDFium often hands us raw RGBA, and even when
-            // the embedded form was JPEG, decode → re-encode is fine
-            // for the kind of resolutions inside PDFs.
-            let mut png_bytes: Vec<u8> = Vec::new();
-            if let Err(e) = dyn_img.write_to(
-                &mut std::io::Cursor::new(&mut png_bytes),
-                image::ImageFormat::Png,
-            ) {
-                eprintln!(
-                    "[extract_pdf_images] page {} PNG encode failed: {e}",
-                    page_idx + 1
-                );
-                continue;
-            }
-
-            idx += 1;
-            let data_base64 = B64.encode(&png_bytes);
-            let sha256 = sha256_hex(&png_bytes);
-
-            out.push(ExtractedImage {
-                index: idx,
-                mime_type: "image/png".to_string(),
-                page: Some((page_idx + 1) as u32),
-                width,
-                height,
-                data_base64,
-                sha256,
-            });
-
-            if out.len() >= options.max_images {
-                eprintln!(
-                    "[extract_pdf_images] reached max_images={} cap; remaining images skipped",
-                    options.max_images
-                );
-                break 'pages;
-            }
-        }
-    }
-
-    Ok(out)
-}
 
 // ── PPTX / DOCX (zip) ──────────────────────────────────────────────────
 
-/// Office Open XML formats (PPTX, DOCX) embed images verbatim under
-/// `<root>/media/`. We don't parse the surrounding XML to figure out
-/// which slide / paragraph an image lives in — that's more work than
-/// this phase needs. PPTX gets a slide number heuristic via the
-/// reference graph (`slide<N>.xml.rels` files reference `media/...`),
-/// but for v1 we just pass `page: None` for DOCX and a best-effort
-/// slide number for PPTX.
-pub fn extract_office_images(
-    path: &str,
-    options: &ExtractOptions,
-) -> Result<Vec<ExtractedImage>, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open '{path}': {e}"))?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip '{path}': {e}"))?;
 
-    // Detect whether this is a PPTX or DOCX/etc. by looking for the
-    // canonical xml entry. PPTX has presentation.xml; DOCX has
-    // document.xml. Only PPTX gets the slide-number lookup.
-    let is_pptx = archive
-        .file_names()
-        .any(|n| n == "ppt/presentation.xml" || n.starts_with("ppt/slides/slide"));
 
-    // Build a map of media_filename -> Option<slide_number>. For
-    // PPTX, scan each slide<N>.xml.rels for media references. For
-    // DOCX, no per-image page info — leave map empty / None.
-    let media_to_slide = if is_pptx {
-        build_pptx_media_slide_map(&mut archive)
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    // List media entries up front so we can iterate by_index in a
-    // stable order (file_names order is consistent within a single
-    // archive). `by_index` is the zip crate's recommended pattern
-    // for iteration since `by_name` re-walks the central directory
-    // on every call.
-    let media_indices: Vec<usize> = (0..archive.len())
-        .filter(|i| {
-            archive
-                .by_index_raw(*i)
-                .ok()
-                .map(|f| is_media_path(f.name()))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    let mut out: Vec<ExtractedImage> = Vec::new();
-    let mut idx: u32 = 0;
-
-    for archive_idx in media_indices {
-        let mut entry = match archive.by_index(archive_idx) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("[extract_office_images] zip entry {archive_idx} read failed: {e}");
-                continue;
-            }
-        };
-
-        let entry_name = entry.name().to_string();
-        let mime_type = guess_mime_from_name(&entry_name);
-        if mime_type.is_none() {
-            // Unknown extension (svg / emf / wmf etc.) — skip rather
-            // than try to handle vector formats in this phase.
-            continue;
-        }
-        let mime_type = mime_type.unwrap();
-
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
-        if let Err(e) = entry.read_to_end(&mut bytes) {
-            eprintln!("[extract_office_images] read '{entry_name}' failed: {e}");
-            continue;
-        }
-
-        // We need width/height to apply the size filter. Decoding via
-        // the `image` crate is the safest cross-format path; it
-        // recognizes PNG/JPEG/GIF/WEBP/BMP without re-encoding.
-        let (width, height) = match image::load_from_memory(&bytes) {
-            Ok(img) => (img.width(), img.height()),
-            Err(e) => {
-                eprintln!("[extract_office_images] decode '{entry_name}' failed: {e}");
-                continue;
-            }
-        };
-        if width < options.min_width || height < options.min_height {
-            continue;
-        }
-
-        idx += 1;
-        let data_base64 = B64.encode(&bytes);
-        let sha256 = sha256_hex(&bytes);
-        let page = media_to_slide.get(&entry_name).copied().flatten();
-
-        out.push(ExtractedImage {
-            index: idx,
-            mime_type,
-            page,
-            width,
-            height,
-            data_base64,
-            sha256,
-        });
-
-        if out.len() >= options.max_images {
-            eprintln!(
-                "[extract_office_images] reached max_images={} cap; remaining skipped",
-                options.max_images
-            );
-            break;
-        }
-    }
-
-    Ok(out)
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-fn is_media_path(name: &str) -> bool {
-    // PPTX: ppt/media/...    DOCX: word/media/...    XLSX: xl/media/...
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("ppt/media/")
-        || lower.starts_with("word/media/")
-        || lower.starts_with("xl/media/")
-}
-
-fn guess_mime_from_name(name: &str) -> Option<String> {
-    let ext = Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png".to_string()),
-        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
-        "gif" => Some("image/gif".to_string()),
-        "webp" => Some("image/webp".to_string()),
-        "bmp" => Some("image/bmp".to_string()),
-        // Vector formats explicitly skipped — we don't have a
-        // rasterizer wired up in this phase.
-        _ => None,
-    }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    hex_encode(&digest)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-/// Walk every `ppt/slides/slide<N>.xml.rels` file and record which
-/// `ppt/media/*` files each slide references. Returns a flat map
-/// `media_path -> Some(slide_number)`. If a media file isn't
-/// referenced from any slide (rare; usually unused theme assets),
-/// it's absent from the map and gets `None` at the call site.
-fn build_pptx_media_slide_map(
-    archive: &mut zip::ZipArchive<File>,
-) -> std::collections::HashMap<String, Option<u32>> {
-    use std::collections::HashMap;
-    let mut out: HashMap<String, Option<u32>> = HashMap::new();
-
-    // Collect rels paths first so we don't hold an active `archive`
-    // borrow while reading. The clone is cheap (just file names).
-    let rels_paths: Vec<String> = archive
-        .file_names()
-        .filter(|n| {
-            // ppt/slides/_rels/slide<N>.xml.rels
-            n.starts_with("ppt/slides/_rels/slide") && n.ends_with(".xml.rels")
-        })
-        .map(String::from)
-        .collect();
-
-    for rels_path in rels_paths {
-        // Slide number is the digits between "slide" and ".xml.rels".
-        let slide_num: Option<u32> = rels_path
-            .strip_prefix("ppt/slides/_rels/slide")
-            .and_then(|s| s.strip_suffix(".xml.rels"))
-            .and_then(|s| s.parse().ok());
-
-        let mut entry = match archive.by_name(&rels_path) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let mut xml = String::new();
-        if entry.read_to_string(&mut xml).is_err() {
-            continue;
-        }
-
-        // Naive extraction: rels XML has Target="../media/imageN.png"
-        // attributes for image relationships. We don't bother with a
-        // full XML parser — a substring scan is plenty for this.
-        let mut search_from = 0;
-        while let Some(pos) = xml[search_from..].find("Target=\"") {
-            let start = search_from + pos + "Target=\"".len();
-            let end = match xml[start..].find('"') {
-                Some(e) => start + e,
-                None => break,
-            };
-            let target = &xml[start..end];
-            search_from = end + 1;
-
-            // Targets are relative to the slide's _rels folder, e.g.
-            // "../media/image3.png" → "ppt/media/image3.png".
-            if let Some(stripped) = target.strip_prefix("../") {
-                let canonical = format!("ppt/{stripped}");
-                if is_media_path(&canonical) {
-                    out.insert(canonical, slide_num);
-                }
-            }
-        }
-    }
-
-    out
-}
 
 // ── Extract-and-save: write to disk, skip the base64 round-trip ────────
 //
@@ -687,37 +314,6 @@ fn build_pptx_media_slide_map(
 // base64 string → JS allocates → JS calls back to Rust → decode →
 // write). The functions below short-circuit by writing directly.
 
-/// Metadata for an image that's already been written to disk.
-/// Mirrors `ExtractedImage` but swaps `data_base64` for `rel_path` —
-/// the path the caller can embed in markdown (`![alt](rel_path)`).
-///
-/// `rename_all = "camelCase"` is REQUIRED, not cosmetic. The TS layer
-/// validates the IPC payload by exact field names (`relPath`,
-/// `absPath`, `mimeType`) — without this attribute serde would emit
-/// `rel_path`/`abs_path`/`mime_type` and the validator drops every
-/// item, returning `[]` even when extraction succeeded and saved
-/// files to disk. Tauri's IPC auto-camelCase only applies to
-/// COMMAND PARAMETER names, never to serialized return values.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SavedImage {
-    pub index: u32,
-    pub mime_type: String,
-    pub page: Option<u32>,
-    pub width: u32,
-    pub height: u32,
-    /// Path of the written file, relative to `dest_dir_relative_to`.
-    /// E.g. when `dest_dir` is `<project>/wiki/media/foo` and
-    /// `dest_dir_relative_to` is `<project>/wiki`, this is
-    /// `media/foo/img-1.png`. The caller-provided base lets us
-    /// generate paths that work inside markdown rendered from
-    /// anywhere under the wiki root.
-    pub rel_path: String,
-    /// Absolute path on disk — the chat / file-preview UI uses this
-    /// (via `convertFileSrc`) to actually load the image.
-    pub abs_path: String,
-    pub sha256: String,
-}
 
 fn save_one_image(
     bytes: &[u8],
@@ -750,366 +346,15 @@ fn ext_for_mime(mime: &str) -> &'static str {
     }
 }
 
-/// PDF: extract every embedded image AND write each to
-/// `dest_dir / img-<index>.<ext>`. `rel_to` is the directory the
-/// returned `rel_path` is anchored at (typically the wiki root).
-/// PNG re-encoding is unconditional (pdfium hands us decoded bitmaps
-/// regardless of source codec).
-pub fn extract_and_save_pdf_images(
-    path: &str,
-    dest_dir: &Path,
-    rel_to: &Path,
-    options: &ExtractOptions,
-) -> Result<Vec<SavedImage>, String> {
-    use pdfium_render::prelude::*;
-
-    // See `extract_pdf_images` for why this lock is mandatory.
-    let _guard = crate::commands::fs::lock_pdfium();
-    let pdfium = crate::commands::fs::pdfium()?;
-    let doc = pdfium
-        .load_pdf_from_file(path, None)
-        .map_err(|e| format!("Failed to open PDF '{path}': {e}"))?;
-
-    let mut out: Vec<SavedImage> = Vec::new();
-    let mut idx: u32 = 0;
-    // Diagnostic counters — when extraction returns empty, the user's
-    // first question is "did the PDF actually have raster images?"
-    // These let us answer it from logs without having to crack open
-    // the PDF in a debugger.
-    let mut total_objects: u32 = 0;
-    let mut total_image_objects: u32 = 0;
-    let mut filtered_too_small: u32 = 0;
-    let mut filtered_full_page: u32 = 0;
-    let mut filtered_decode_err: u32 = 0;
-    let mut filtered_encode_err: u32 = 0;
-
-    let page_count = doc.pages().len();
-    eprintln!(
-        "[extract_and_save_pdf_images] '{path}': {} page(s), filter=({}x{}) min, max={}",
-        page_count, options.min_width, options.min_height, options.max_images
-    );
-
-    'pages: for (page_idx, page) in doc.pages().iter().enumerate() {
-        let mut page_has_meaningful_text: Option<bool> = None;
-        for object in page.objects().iter() {
-            total_objects += 1;
-            let image = match object.as_image_object() {
-                Some(img) => img,
-                None => continue,
-            };
-            total_image_objects += 1;
-            let should_skip = if options.skip_full_page_images {
-                let has_meaningful_text = *page_has_meaningful_text.get_or_insert_with(|| {
-                    pdf_page_has_meaningful_text(&page, options.full_page_min_text_chars)
-                });
-                should_skip_full_page_pdf_image(
-                    &object,
-                    page.width().value,
-                    page.height().value,
-                    has_meaningful_text,
-                    options,
-                )
-            } else {
-                false
-            };
-            if should_skip {
-                filtered_full_page += 1;
-                eprintln!(
-                    "[extract_and_save_pdf_images] page {} image covers most of page — skipped",
-                    page_idx + 1
-                );
-                continue;
-            }
-            let dyn_img = match image.get_raw_image() {
-                Ok(b) => b,
-                Err(e) => {
-                    filtered_decode_err += 1;
-                    eprintln!(
-                        "[extract_and_save_pdf_images] page {} image read failed: {e}",
-                        page_idx + 1
-                    );
-                    continue;
-                }
-            };
-            let width = dyn_img.width();
-            let height = dyn_img.height();
-            if width < options.min_width || height < options.min_height {
-                filtered_too_small += 1;
-                eprintln!(
-                    "[extract_and_save_pdf_images] page {} image {}x{} < min ({}x{}) — skipped",
-                    page_idx + 1,
-                    width,
-                    height,
-                    options.min_width,
-                    options.min_height
-                );
-                continue;
-            }
-
-            let mut png_bytes: Vec<u8> = Vec::new();
-            if let Err(e) = dyn_img.write_to(
-                &mut std::io::Cursor::new(&mut png_bytes),
-                image::ImageFormat::Png,
-            ) {
-                filtered_encode_err += 1;
-                eprintln!(
-                    "[extract_and_save_pdf_images] page {} PNG encode failed: {e}",
-                    page_idx + 1
-                );
-                continue;
-            }
-
-            idx += 1;
-            let file_name = format!("img-{idx}.png");
-            let (rel_path, abs_path) = save_one_image(&png_bytes, dest_dir, rel_to, &file_name)?;
-            let sha256 = sha256_hex(&png_bytes);
-
-            out.push(SavedImage {
-                index: idx,
-                mime_type: "image/png".to_string(),
-                page: Some((page_idx + 1) as u32),
-                width,
-                height,
-                rel_path,
-                abs_path,
-                sha256,
-            });
-
-            if out.len() >= options.max_images {
-                eprintln!(
-                    "[extract_and_save_pdf_images] reached max_images={} cap; skipped rest",
-                    options.max_images
-                );
-                break 'pages;
-            }
-        }
-    }
-
-    eprintln!(
-        "[extract_and_save_pdf_images] '{path}' DONE — saved={}, total_objects={}, image_objects={}, too_small={}, full_page={}, decode_err={}, encode_err={}",
-        out.len(), total_objects, total_image_objects, filtered_too_small, filtered_full_page, filtered_decode_err, filtered_encode_err,
-    );
-
-    Ok(out)
-}
-
-/// PPTX/DOCX: pull embedded images directly from the zip media/
-/// directory and write each to `dest_dir`. Source format is
-/// preserved (PNG stays PNG, JPEG stays JPEG) since pulling the raw
-/// bytes is cheap and there's no compositing happening.
-pub fn extract_and_save_office_images(
-    path: &str,
-    dest_dir: &Path,
-    rel_to: &Path,
-    options: &ExtractOptions,
-) -> Result<Vec<SavedImage>, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open '{path}': {e}"))?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip '{path}': {e}"))?;
-
-    let is_pptx = archive
-        .file_names()
-        .any(|n| n == "ppt/presentation.xml" || n.starts_with("ppt/slides/slide"));
-    let media_to_slide = if is_pptx {
-        build_pptx_media_slide_map(&mut archive)
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    let media_indices: Vec<usize> = (0..archive.len())
-        .filter(|i| {
-            archive
-                .by_index_raw(*i)
-                .ok()
-                .map(|f| is_media_path(f.name()))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    let mut out: Vec<SavedImage> = Vec::new();
-    let mut idx: u32 = 0;
-
-    for archive_idx in media_indices {
-        let mut entry = match archive.by_index(archive_idx) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("[extract_and_save_office_images] zip entry read failed: {e}");
-                continue;
-            }
-        };
-        let entry_name = entry.name().to_string();
-        let mime_type = match guess_mime_from_name(&entry_name) {
-            Some(m) => m,
-            None => continue,
-        };
-
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
-        if let Err(e) = entry.read_to_end(&mut bytes) {
-            eprintln!("[extract_and_save_office_images] read '{entry_name}' failed: {e}");
-            continue;
-        }
-
-        let (width, height) = match image::load_from_memory(&bytes) {
-            Ok(img) => (img.width(), img.height()),
-            Err(e) => {
-                eprintln!("[extract_and_save_office_images] decode '{entry_name}' failed: {e}");
-                continue;
-            }
-        };
-        if width < options.min_width || height < options.min_height {
-            continue;
-        }
-
-        idx += 1;
-        let ext = ext_for_mime(&mime_type);
-        let file_name = format!("img-{idx}.{ext}");
-        let (rel_path, abs_path) = save_one_image(&bytes, dest_dir, rel_to, &file_name)?;
-        let sha256 = sha256_hex(&bytes);
-        let page = media_to_slide.get(&entry_name).copied().flatten();
-
-        out.push(SavedImage {
-            index: idx,
-            mime_type,
-            page,
-            width,
-            height,
-            rel_path,
-            abs_path,
-            sha256,
-        });
-
-        if out.len() >= options.max_images {
-            eprintln!(
-                "[extract_and_save_office_images] reached max_images={} cap; skipped rest",
-                options.max_images
-            );
-            break;
-        }
-    }
-
-    Ok(out)
-}
-
-// ── Tauri command bindings ─────────────────────────────────────────────
-
-// Why every cmd below is `spawn_blocking`:
-// PDFium FFI calls and zip+image-decode are all blocking. Running
-// them inside an `async fn` body (as we did before this fix) kept
-// them on a tokio worker thread, blocking other async tasks on
-// that worker for the full duration of the extraction. `spawn_
-// blocking` moves the work to tokio's blocking pool — that's the
-// pool's contract. (Combined with the PDFium mutex inside
-// `extract_pdf_images`, this also prevents the segfault that hit
-// when two PDF extractions raced on different workers.)
-
-pub async fn extract_pdf_images_cmd(path: String) -> Result<Vec<ExtractedImage>, String> {
-    tokio::task::spawn_blocking(move || {
-        crate::panic_guard::run_guarded("extract_pdf_images", || {
-            extract_pdf_images(&path, &ExtractOptions::default())
-        })
-    })
-    .await
-    .map_err(|e| format!("extract_pdf_images blocking task join error: {e}"))?
-}
-
-pub async fn extract_office_images_cmd(path: String) -> Result<Vec<ExtractedImage>, String> {
-    tokio::task::spawn_blocking(move || {
-        crate::panic_guard::run_guarded("extract_office_images", || {
-            extract_office_images(&path, &ExtractOptions::default())
-        })
-    })
-    .await
-    .map_err(|e| format!("extract_office_images blocking task join error: {e}"))?
-}
-
-pub async fn extract_and_save_pdf_images_cmd(
-    source_path: String,
-    dest_dir: String,
-    rel_to: String,
-) -> Result<Vec<SavedImage>, String> {
-    tokio::task::spawn_blocking(move || {
-        crate::panic_guard::run_guarded("extract_and_save_pdf_images", || {
-            extract_and_save_pdf_images(
-                &source_path,
-                Path::new(&dest_dir),
-                Path::new(&rel_to),
-                &ExtractOptions::default(),
-            )
-        })
-    })
-    .await
-    .map_err(|e| format!("extract_and_save_pdf_images blocking task join error: {e}"))?
-}
-
-pub async fn extract_and_save_office_images_cmd(
-    source_path: String,
-    dest_dir: String,
-    rel_to: String,
-) -> Result<Vec<SavedImage>, String> {
-    tokio::task::spawn_blocking(move || {
-        crate::panic_guard::run_guarded("extract_and_save_office_images", || {
-            extract_and_save_office_images(
-                &source_path,
-                Path::new(&dest_dir),
-                Path::new(&rel_to),
-                &ExtractOptions::default(),
-            )
-        })
-    })
-    .await
-    .map_err(|e| format!("extract_and_save_office_images blocking task join error: {e}"))?
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn is_media_path_recognizes_pptx_docx_xlsx() {
-        assert!(is_media_path("ppt/media/image1.png"));
-        assert!(is_media_path("word/media/image2.jpeg"));
-        assert!(is_media_path("xl/media/image3.gif"));
-        assert!(!is_media_path("ppt/slides/slide1.xml"));
-        assert!(!is_media_path("word/document.xml"));
-        assert!(!is_media_path("docProps/thumbnail.jpeg"));
-    }
-
-    #[test]
-    fn guess_mime_from_name_covers_common_formats() {
-        assert_eq!(
-            guess_mime_from_name("ppt/media/image1.PNG"),
-            Some("image/png".to_string())
-        );
-        assert_eq!(
-            guess_mime_from_name("word/media/image2.jpeg"),
-            Some("image/jpeg".to_string())
-        );
-        assert_eq!(
-            guess_mime_from_name("ppt/media/image3.jpg"),
-            Some("image/jpeg".to_string())
-        );
-        // Vector formats deliberately rejected — we don't rasterize
-        // SVG/EMF/WMF in this phase, surfacing them as strings would
-        // mislead the caption pipeline.
-        assert_eq!(guess_mime_from_name("ppt/media/foo.svg"), None);
-        assert_eq!(guess_mime_from_name("ppt/media/foo.emf"), None);
-    }
-
-    #[test]
-    fn sha256_hex_is_deterministic_and_64_chars() {
-        let h1 = sha256_hex(b"hello world");
-        let h2 = sha256_hex(b"hello world");
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 64);
-        // Known SHA-256 of "hello world".
-        assert_eq!(
-            h1,
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-        );
-    }
-
+    
+    
+    
     #[test]
     fn extract_options_defaults_match_plan() {
         // Plan documents 100×100 / 500 as the v1 defaults. Pinning

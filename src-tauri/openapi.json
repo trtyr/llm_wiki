@@ -1026,6 +1026,89 @@
           }
         }
       }
+    },
+    "/api/v1/projects/{projectId}/sources/queue": {
+      "get": {
+        "summary": "Inspect the source change queue",
+        "description": "Returns the pending/processing/done/failed change tasks for the project's raw sources (F-45).",
+        "parameters": [
+          {
+            "name": "projectId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{ ok, projectId, queue }"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/sources/queue/{taskId}/retry": {
+      "post": {
+        "summary": "Re-arm and process a failed queue task",
+        "parameters": [
+          {
+            "name": "projectId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "taskId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{ ok, projectId, queue }"
+          },
+          "500": {
+            "description": "Task could not be retried"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/sources/queue/{taskId}": {
+      "delete": {
+        "summary": "Drop a failed queue task",
+        "parameters": [
+          {
+            "name": "projectId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "taskId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{ ok, projectId, queue }"
+          },
+          "500": {
+            "description": "Task could not be removed"
+          }
+        }
+      }
     }
   }
 }
