@@ -123,11 +123,9 @@ pub async fn export_project_archive(
     project_path: String,
     destination: String,
 ) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        export_project_archive_inner(project_path, destination)
-    })
-    .await
-    .map_err(|error| format!("Project export task failed: {error}"))?
+    tokio::task::spawn_blocking(move || export_project_archive_inner(project_path, destination))
+        .await
+        .map_err(|error| format!("Project export task failed: {error}"))?
 }
 
 fn resolve_export_destination(root: &Path, output: &Path) -> Result<PathBuf, String> {
@@ -210,7 +208,8 @@ fn export_project_archive_inner(project_path: String, destination: String) -> Re
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     for (path, name) in &entries {
         if name.ends_with('/') {
-            zip.add_directory(name, options).map_err(|e| e.to_string())?;
+            zip.add_directory(name, options)
+                .map_err(|e| e.to_string())?;
         } else {
             zip.start_file(name, options).map_err(|e| e.to_string())?;
             let mut source = File::open(path).map_err(|e| e.to_string())?;
@@ -225,11 +224,9 @@ pub async fn import_project_archive(
     archive_path: String,
     destination: String,
 ) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        import_project_archive_inner(archive_path, destination)
-    })
-    .await
-    .map_err(|error| format!("Project import task failed: {error}"))?
+    tokio::task::spawn_blocking(move || import_project_archive_inner(archive_path, destination))
+        .await
+        .map_err(|error| format!("Project import task failed: {error}"))?
 }
 
 fn import_project_archive_inner(

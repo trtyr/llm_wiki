@@ -29,7 +29,10 @@ const APP_IDENTIFIER: &str = "com.llmwiki.app";
 /// Entry point for the `llm-server` binary. Blocks until Ctrl-C, then
 /// returns the process exit code.
 pub fn run_headless_server() -> i32 {
-    eprintln!("[llm-server] LLM Wiki headless server v{}", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "[llm-server] LLM Wiki headless server v{}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let data_dir = resolve_data_dir();
     if let Err(err) = std::fs::create_dir_all(&data_dir) {
@@ -108,8 +111,11 @@ fn default_app_data_dir() -> Option<PathBuf> {
         }
         #[cfg(target_os = "macos")]
         {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join("Library").join("Application Support"))
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+            })
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         {
@@ -153,8 +159,11 @@ fn ensure_registered_project() -> Result<(), String> {
             "name": name,
             "createdAt": chrono::Local::now().format("%Y-%m-%d").to_string(),
         });
-        std::fs::write(&project_json, serde_json::to_string_pretty(&payload).unwrap_or_default())
-            .map_err(|err| format!("cannot write {}: {err}", project_json.display()))?;
+        std::fs::write(
+            &project_json,
+            serde_json::to_string_pretty(&payload).unwrap_or_default(),
+        )
+        .map_err(|err| format!("cannot write {}: {err}", project_json.display()))?;
         // Minimal wiki layout so agents and clips have somewhere to land.
         let _ = std::fs::create_dir_all(root.join("wiki"));
         let _ = std::fs::create_dir_all(root.join("raw").join("sources"));
@@ -173,10 +182,7 @@ fn ensure_registered_project() -> Result<(), String> {
 }
 
 fn warn_if_exposed(bind_host: &str, store_path: &Path) {
-    let loopback = matches!(
-        bind_host,
-        "127.0.0.1" | "localhost" | "::1" | "[::1]"
-    );
+    let loopback = matches!(bind_host, "127.0.0.1" | "localhost" | "::1" | "[::1]");
     if loopback {
         return;
     }

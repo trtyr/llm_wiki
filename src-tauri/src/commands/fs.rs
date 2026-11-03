@@ -141,9 +141,7 @@ pub(crate) fn preprocess_file_sync(path: &Path) -> Result<String, String> {
         let text = match ext.as_str() {
             "pdf" => extract_pdf_text(&path.to_string_lossy(), false)?,
             "org" => extract_org_text(&path.to_string_lossy())?,
-            e if OFFICE_EXTS.contains(&e) => {
-                extract_office_text(&path.to_string_lossy(), e)?
-            }
+            e if OFFICE_EXTS.contains(&e) => extract_office_text(&path.to_string_lossy(), e)?,
             e if EBOOK_EXTS.contains(&e) => {
                 crate::commands::ebook::extract_ebook_text(&path.to_string_lossy(), e)?
             }
@@ -158,11 +156,9 @@ pub(crate) fn preprocess_file_sync(path: &Path) -> Result<String, String> {
 /// Pre-process a file and cache the extracted text.
 pub async fn preprocess_file(path: String) -> Result<String, String> {
     // See `read_file` above for why `spawn_blocking` is required.
-    tokio::task::spawn_blocking(move || {
-        preprocess_file_sync(Path::new(&path))
-    })
-    .await
-    .map_err(|e| format!("preprocess_file blocking task join error: {e}"))?
+    tokio::task::spawn_blocking(move || preprocess_file_sync(Path::new(&path)))
+        .await
+        .map_err(|e| format!("preprocess_file blocking task join error: {e}"))?
 }
 
 fn cache_path_for(original: &Path) -> std::path::PathBuf {
@@ -854,7 +850,6 @@ fn read_zip_file(archive: &mut zip::ZipArchive<fs::File>, name: &str) -> Option<
     Some(content)
 }
 
-
 fn decode_xml_entities(text: &str) -> String {
     // Single pass, &amp; resolved LAST (F-39): the old replace chain ran
     // &amp; first, so literal "&lt;" encoded as "&amp;lt;" collapsed into
@@ -886,19 +881,17 @@ fn decode_xml_entities(text: &str) -> String {
             "quot" => Some('"'.to_string()),
             "apos" => Some('\''.to_string()),
             "amp" => None, // resolved last: treat as literal for now
-            _ => {
-                if let Some(hex) = entity
-                    .strip_prefix("#x")
-                    .or_else(|| entity.strip_prefix("#X"))
-                {
-                    u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
-                } else if let Some(dec) = entity.strip_prefix('#') {
-                    dec.parse::<u32>().ok().and_then(char::from_u32)
-                } else {
-                    None
-                }
-                .map(|c| c.to_string())
+            _ => if let Some(hex) = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+            {
+                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            } else if let Some(dec) = entity.strip_prefix('#') {
+                dec.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                None
             }
+            .map(|c| c.to_string()),
         };
         match replacement {
             Some(mut decoded) => {
@@ -1510,11 +1503,7 @@ pub async fn write_file_base64(path: String, base64: String) -> Result<(), Strin
             );
             replace_file_atomically(p, &bytes)
                 .map_err(|e| format!("Failed to write binary file '{}': {}", path, e))?;
-            crate::commands::file_history::record_file_version(
-                p,
-                "human",
-                "ui.write_file_base64",
-            );
+            crate::commands::file_history::record_file_version(p, "human", "ui.write_file_base64");
             file_sync::mark_app_write_path(p);
             Ok(())
         })

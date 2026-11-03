@@ -27,10 +27,7 @@ pub fn is_allowed_browser_origin(origin: &str) -> bool {
 pub fn requests_private_network(request: &tiny_http::Request) -> bool {
     request.headers().iter().any(|header| {
         header.field.equiv("Access-Control-Private-Network-Request")
-            && header
-                .value
-                .as_str()
-                .eq_ignore_ascii_case("true")
+            && header.value.as_str().eq_ignore_ascii_case("true")
     })
 }
 

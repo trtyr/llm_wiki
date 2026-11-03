@@ -9,13 +9,13 @@
 mod agent;
 mod api_docs;
 mod api_graph;
-mod api_sse;
 mod api_server;
-mod project_registry;
+mod api_sse;
 mod commands;
 mod cors;
 pub mod headless;
 mod panic_guard;
+mod project_registry;
 mod proxy;
 mod server_bind;
 mod server_host;

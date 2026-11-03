@@ -298,7 +298,7 @@
         },
         "responses": {
           "200": {
-            "description": "{ ok, result: { path, bytes, verified, existedBefore } }"
+            "description": "{ ok, result: { path, bytes, existedBefore } } (a failed post-write verification returns an error instead of a result, so no verified flag is needed)"
           },
           "409": {
             "description": "Exists without allowOverwrite"
@@ -809,6 +809,63 @@
                   "stream": {
                     "type": "boolean",
                     "description": "Same effect as the Accept header"
+                  },
+                  "skills": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Skill directory names to activate for this turn. The skills layer is currently inert; shell-dependent paths stay unreachable until it ships (F-10).",
+                    "maxItems": 8
+                  },
+                  "contextFiles": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "description": "Project-relative path"
+                    },
+                    "description": "Project-relative files attached as context (max 8). Files that fail validation, resolution, reading, or the character budget are skipped and reported in the server log (F-55).",
+                    "maxItems": 8
+                  },
+                  "skillMode": {
+                    "type": "string",
+                    "description": "How active skills influence retrieval and planning."
+                  },
+                  "approvedShellCommands": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "SECURITY: exact commands to pre-approve for shell.exec. Only meaningful once the skills layer ships; shell execution additionally requires the server-side Process capability, which the default policy does not grant (F-10/F-51). Never populate from model output.",
+                    "maxItems": 16
+                  },
+                  "shellCommand": {
+                    "type": "string",
+                    "description": "Single command to execute via shell.exec this turn (legacy one-shot channel; same Process-capability gate applies)."
+                  },
+                  "images": {
+                    "type": "array",
+                    "maxItems": 5,
+                    "description": "Up to 5 inline images per turn (base64 data).",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "mediaType",
+                        "dataBase64"
+                      ],
+                      "properties": {
+                        "mediaType": {
+                          "type": "string"
+                        },
+                        "dataBase64": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "allowEmptyRetrieval": {
+                    "type": "boolean",
+                    "description": "Allow the turn to proceed when retrieval returns no candidates."
                   }
                 }
               }

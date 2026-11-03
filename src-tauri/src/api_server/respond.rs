@@ -5,15 +5,14 @@
 use serde_json::Value;
 use tiny_http::Header;
 
-use crate::cors::requests_private_network;
 use super::router::cors_headers;
 use super::*;
+use crate::cors::requests_private_network;
 
 pub(super) const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 pub(super) const RATE_LIMIT_MAX_REQUESTS: usize = 120;
-pub(super) static RATE_LIMIT: OnceLock<
-    Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
-> = OnceLock::new();
+pub(super) static RATE_LIMIT: OnceLock<Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>> =
+    OnceLock::new();
 
 pub(super) struct ApiResponse {
     pub(super) status: u16,
@@ -39,7 +38,12 @@ pub(super) fn err_internal(label: &str, error: impl std::fmt::Display) -> ApiRes
     err(500, "Internal API server error")
 }
 
-pub(super) fn respond_error(request: tiny_http::Request, status: u16, message: &str, origin: Option<&str>) {
+pub(super) fn respond_error(
+    request: tiny_http::Request,
+    status: u16,
+    message: &str,
+    origin: Option<&str>,
+) {
     respond_json(
         request,
         status,
@@ -57,14 +61,18 @@ pub(super) fn respond_options(request: tiny_http::Request, origin: Option<&str>)
     let _ = request.respond(response);
 }
 
-pub(super) fn respond_json(request: tiny_http::Request, status: u16, body: Value, origin: Option<&str>) {
+pub(super) fn respond_json(
+    request: tiny_http::Request,
+    status: u16,
+    body: Value,
+    origin: Option<&str>,
+) {
     let mut response = Response::from_string(body.to_string()).with_status_code(StatusCode(status));
     for header in cors_headers(origin, requests_private_network(&request)) {
         response.add_header(header);
     }
     let _ = request.respond(response);
 }
-
 
 pub(super) fn should_rate_limit(method: &Method, url: &str) -> bool {
     if method == &Method::Options {
@@ -77,9 +85,8 @@ pub(super) fn should_rate_limit(method: &Method, url: &str) -> bool {
 pub(super) fn allow_request(peer: Option<std::net::IpAddr>) -> bool {
     let now = Instant::now();
     let window_start = now - RATE_LIMIT_WINDOW;
-    let lock = RATE_LIMIT.get_or_init(|| {
-        Mutex::new(HashMap::<std::net::IpAddr, VecDeque<Instant>>::new())
-    });
+    let lock = RATE_LIMIT
+        .get_or_init(|| Mutex::new(HashMap::<std::net::IpAddr, VecDeque<Instant>>::new()));
     let Ok(mut buckets) = lock.lock() else {
         return false;
     };
@@ -88,9 +95,7 @@ pub(super) fn allow_request(peer: Option<std::net::IpAddr>) -> bool {
     // single client can no longer exhaust everyone else's quota. The
     // map is bounded so a spoofed-source flood cannot grow it forever.
     if buckets.len() > 1024 {
-        buckets.retain(|_, hits| {
-            hits.back().map(|t| *t >= window_start).unwrap_or(false)
-        });
+        buckets.retain(|_, hits| hits.back().map(|t| *t >= window_start).unwrap_or(false));
     }
     let key = peer.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     let hits = buckets.entry(key).or_default();
@@ -103,4 +108,3 @@ pub(super) fn allow_request(peer: Option<std::net::IpAddr>) -> bool {
     hits.push_back(now);
     true
 }
-

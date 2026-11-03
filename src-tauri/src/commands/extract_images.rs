@@ -17,7 +17,6 @@
 
 use std::path::Path;
 
-
 const MIN_FULL_PAGE_SKIP_RATIO: f32 = 0.5;
 const MAX_FULL_PAGE_SKIP_RATIO: f32 = 1.0;
 
@@ -79,8 +78,6 @@ fn is_full_page_image_bounds(
     object_width / page_width >= ratio && object_height / page_height >= ratio
 }
 
-
-
 fn has_meaningful_page_text(text: &str, min_chars: usize) -> bool {
     text.chars().filter(|c| !c.is_whitespace()).count() >= min_chars
 }
@@ -106,7 +103,6 @@ fn should_skip_full_page_pdf_image(
 
 // ── PDF (pdfium) ────────────────────────────────────────────────────────
 
-
 fn is_full_page_pdf_image_object(
     object: &pdfium_render::prelude::PdfPageObject<'_>,
     page_width: f32,
@@ -129,7 +125,6 @@ fn is_full_page_pdf_image_object(
         .unwrap_or(false)
 }
 
-
 fn should_skip_full_page_image_decision(
     skip_enabled: bool,
     page_has_meaningful_text: bool,
@@ -137,7 +132,6 @@ fn should_skip_full_page_image_decision(
 ) -> bool {
     skip_enabled && page_has_meaningful_text && image_is_full_page
 }
-
 
 /// Combined PDF text + image extraction in a single pdfium session.
 ///
@@ -299,11 +293,7 @@ pub fn extract_pdf_markdown(
     Ok(out)
 }
 
-
 // ── PPTX / DOCX (zip) ──────────────────────────────────────────────────
-
-
-
 
 // ── Extract-and-save: write to disk, skip the base64 round-trip ────────
 //
@@ -313,7 +303,6 @@ pub fn extract_pdf_markdown(
 // markdown — the round-trip via JS is wasteful (5 MB image → 6.7 MB
 // base64 string → JS allocates → JS calls back to Rust → decode →
 // write). The functions below short-circuit by writing directly.
-
 
 fn save_one_image(
     bytes: &[u8],
@@ -352,9 +341,6 @@ fn ext_for_mime(mime: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    
-    
-    
     #[test]
     fn extract_options_defaults_match_plan() {
         // Plan documents 100×100 / 500 as the v1 defaults. Pinning

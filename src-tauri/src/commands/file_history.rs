@@ -113,7 +113,10 @@ fn history_path(root: &Path, path: &Path) -> PathBuf {
     // Normalize separators: callers join paths with mixed `/` and \\
     // (canonicalized paths arrive with \\), and the store address must
     // depend only on the logical relative path.
-    let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy()
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
         .replace('\\', "/");
     // Fixed FNV-1a keeps history addresses stable across Rust/toolchain upgrades.
     let mut hash = 0xcbf29ce484222325_u64;
@@ -249,7 +252,10 @@ pub fn record_file_version(path: &Path, author: &str, tool: &str) -> bool {
         return false;
     }
     let Ok(_guard) = HISTORY_LOCK.lock() else {
-        eprintln!("[history] lock poisoned; skipping version for {}", path.display());
+        eprintln!(
+            "[history] lock poisoned; skipping version for {}",
+            path.display()
+        );
         return false;
     };
     let settings = read_history_settings(&root);
@@ -257,7 +263,10 @@ pub fn record_file_version(path: &Path, author: &str, tool: &str) -> bool {
         return false; // genuinely disabled - the only case the API hint describes
     }
     let Ok(metadata) = fs::metadata(path) else {
-        eprintln!("[history] stat failed for {}: skipping version", path.display());
+        eprintln!(
+            "[history] stat failed for {}: skipping version",
+            path.display()
+        );
         return false;
     };
     if !metadata.is_file() || metadata.len() as usize > MAX_HISTORY_CONTENT_BYTES {
@@ -270,15 +279,24 @@ pub fn record_file_version(path: &Path, author: &str, tool: &str) -> bool {
         return false;
     }
     let Ok(content) = fs::read_to_string(path) else {
-        eprintln!("[history] read failed for {}: skipping version", path.display());
+        eprintln!(
+            "[history] read failed for {}: skipping version",
+            path.display()
+        );
         return false;
     };
     let Ok(dir) = checked_history_dir(&root, true) else {
-        eprintln!("[history] history dir rejected (symlink?) for {}: skipping", path.display());
+        eprintln!(
+            "[history] history dir rejected (symlink?) for {}: skipping",
+            path.display()
+        );
         return false;
     };
     let Ok(checked_store_path) = checked_history_file(&root, path) else {
-        eprintln!("[history] store path rejected for {}: skipping", path.display());
+        eprintln!(
+            "[history] store path rejected for {}: skipping",
+            path.display()
+        );
         return false;
     };
     let Some(file_name) = checked_store_path.file_name().map(ToOwned::to_owned) else {
@@ -401,8 +419,8 @@ pub async fn list_file_history(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => "[]".to_string(),
             Err(e) => return Err(format!("Failed to read history store: {e}")),
         };
-        let mut entries: Vec<FileHistoryEntry> = serde_json::from_str(&raw)
-            .map_err(|err| format!("History store is corrupt: {err}"))?;
+        let mut entries: Vec<FileHistoryEntry> =
+            serde_json::from_str(&raw).map_err(|err| format!("History store is corrupt: {err}"))?;
         entries.reverse();
         Ok(entries)
     })

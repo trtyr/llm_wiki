@@ -39,7 +39,6 @@ fn is_interpreter_command(command: &str) -> bool {
     )
 }
 
-
 pub(crate) fn is_shell_command_approved(command: &str, approved: &[String]) -> bool {
     let command = command.trim();
     !command.is_empty() && approved.iter().any(|item| item.trim() == command)

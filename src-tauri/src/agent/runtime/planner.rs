@@ -3,8 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
 use crate::agent::types::{AgentMode, AgentToolOptions};
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,7 +52,10 @@ pub(super) fn shell_command_from_call(call: &ModelToolCall) -> Option<&str> {
         .filter(|command| !command.is_empty())
 }
 
-pub(super) fn planned_tool_queries(plan: &ModelToolPlan, fallback_query: &str) -> BTreeMap<String, String> {
+pub(super) fn planned_tool_queries(
+    plan: &ModelToolPlan,
+    fallback_query: &str,
+) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for call in &plan.tool_calls {
         let tool = call.tool.trim();

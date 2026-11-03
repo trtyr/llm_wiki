@@ -2169,7 +2169,11 @@ mod tests {
     #[test]
     fn vector_only_materialization_prefers_qualified_rows_over_legacy_rows() {
         let root = tmp_project();
-        write_page(&root, "wiki/entities/topic.md", "# Topic\n\nCurrent content.");
+        write_page(
+            &root,
+            "wiki/entities/topic.md",
+            "# Topic\n\nCurrent content.",
+        );
         let vector_results = vec![
             PageVectorResult {
                 id: "topic".to_string(),
@@ -2188,10 +2192,7 @@ mod tests {
             "entities/topic".to_string(),
             "wiki/entities/topic.md".to_string(),
         )]);
-        let legacy = BTreeMap::from([(
-            "topic".to_string(),
-            "wiki/entities/topic.md".to_string(),
-        )]);
+        let legacy = BTreeMap::from([("topic".to_string(), "wiki/entities/topic.md".to_string())]);
         let mut results = Vec::new();
 
         materialize_vector_only_results(

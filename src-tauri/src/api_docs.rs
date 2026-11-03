@@ -14,7 +14,11 @@ pub fn render(spec: &Value) -> String {
     out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     out.push_str("<title>");
     push_escaped(&mut out, title);
-    let title_suffix = if title.ends_with("API") { " 文档" } else { " API 文档" };
+    let title_suffix = if title.ends_with("API") {
+        " 文档"
+    } else {
+        " API 文档"
+    };
     out.push_str(title_suffix);
     out.push_str("</title>\n<style>\n");
     out.push_str(
@@ -147,7 +151,11 @@ fn curl_example(base: &str, path: &str, method: &str, op: &Value) -> String {
     let has_body = body.is_object();
 
     let mut lines = Vec::new();
-    let method_flag = if method == "get" { "" } else { &format!("-X {} ", method.to_uppercase()) };
+    let method_flag = if method == "get" {
+        ""
+    } else {
+        &format!("-X {} ", method.to_uppercase())
+    };
     let auth = "-H \"Authorization: Bearer $TOKEN\"";
     let head = format!("curl {method_flag}{auth} \\\n  \"{base}{path}{query_string}\"");
     if has_body {

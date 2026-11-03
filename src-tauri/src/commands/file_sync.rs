@@ -20,8 +20,7 @@ const QUEUE_EMIT_EVERY: usize = 25;
 // explicit rescans plus the change queue. (The desktop host used to supply
 // a watcher; that layer was removed with the GUI.) The snapshot
 // reconciliation below serves the on-demand rescan path only (F-47).
-const DEFAULT_SOURCE_WATCH_CONFIG_JSON: &str =
-    include_str!("source-watch-defaults.json");
+const DEFAULT_SOURCE_WATCH_CONFIG_JSON: &str = include_str!("source-watch-defaults.json");
 
 static QUEUE_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static APP_WRITE_IGNORES: OnceLock<Mutex<BTreeMap<String, i64>>> = OnceLock::new();
@@ -1169,7 +1168,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-
     #[test]
     fn prefix_rescan_detects_raw_source_mount_style_changes() {
         let root = temp_root("prefix-rescan");
@@ -1253,7 +1251,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
-
 
     #[test]
     fn retry_limit_keeps_failed_task_failed_on_new_changes() {

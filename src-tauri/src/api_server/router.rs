@@ -63,7 +63,11 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
             return;
         }
         if !is_authorized(&app, query, &headers) {
-            eprintln!("[api] 401 unauthorized {} {}", method, redact_query_token(&url));
+            eprintln!(
+                "[api] 401 unauthorized {} {}",
+                method,
+                redact_query_token(&url)
+            );
             respond_error(
                 request,
                 401,
@@ -135,9 +139,6 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
     });
     respond_json(request, response.status, response.body, origin.as_deref());
 }
-
-
-
 
 fn handle_request(
     app: &ServerHost,
@@ -312,8 +313,6 @@ fn handle_request(
     }
 }
 
-
-
 /// Chat (agent) routes always require a token: they execute tools and can
 /// invoke shell commands, so they are never anonymous.
 fn is_agent_chat_request(method: &Method, path: &str) -> bool {
@@ -342,8 +341,7 @@ pub(super) fn is_token_required_request(method: &Method, path: &str) -> bool {
     // a LAN peer could delete files or rewrite the config anonymously.
     !matches!(
         (method, parts.as_slice()),
-        (&Method::Get, _)
-            | (&Method::Post, ["projects", _, "search"])
+        (&Method::Get, _) | (&Method::Post, ["projects", _, "search"])
     )
 }
 
@@ -422,9 +420,6 @@ fn read_body(request: &mut tiny_http::Request, max_body_bytes: usize) -> Result<
     String::from_utf8(bytes).map_err(|_| "Request body must be UTF-8".to_string())
 }
 
-
-
-
 pub(super) fn cors_headers(origin: Option<&str>, pna_request: bool) -> Vec<Header> {
     local_cors_headers(
         origin,
@@ -432,5 +427,3 @@ pub(super) fn cors_headers(origin: Option<&str>, pna_request: bool) -> Vec<Heade
         pna_request,
     )
 }
-
-

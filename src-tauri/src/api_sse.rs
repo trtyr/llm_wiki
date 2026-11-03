@@ -65,4 +65,3 @@ pub(crate) fn send_terminal_sse(sender: SyncSender<Vec<u8>>, frame: Vec<u8>) {
         let _ = sender.send(frame);
     });
 }
-

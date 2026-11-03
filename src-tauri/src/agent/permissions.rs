@@ -22,6 +22,11 @@ pub struct PermissionPolicy {
 impl PermissionPolicy {
     pub fn api_default() -> Self {
         Self {
+            // Process deliberately NOT granted (F-51): with Process in the
+            // default set, every require(Process) check was a constant Ok
+            // and the permission layer could not actually gate shell
+            // execution. Shell stays double-locked behind skills presence
+            // AND an explicit capability grant.
             allowed: vec![
                 AgentCapability::ReadProject,
                 AgentCapability::ReadSource,
@@ -30,10 +35,6 @@ impl PermissionPolicy {
                 AgentCapability::SearchAnyTxt,
                 AgentCapability::WriteWiki,
                 AgentCapability::Network,
-                // Process remains inert unless AgentChatRequest carries a
-                // separately approved exact shell command. Do not populate that
-                // approval list from model output or persisted conversation data.
-                AgentCapability::Process,
             ],
         }
     }
@@ -61,6 +62,8 @@ mod tests {
         assert!(policy.allows(AgentCapability::SearchWiki));
         assert!(policy.allows(AgentCapability::Network));
         assert!(policy.allows(AgentCapability::WriteWiki));
-        assert!(policy.allows(AgentCapability::Process));
+        // F-51: Process is deliberately NOT in the default set - granting
+        // it made every require(Process) a constant pass.
+        assert!(!policy.allows(AgentCapability::Process));
     }
 }

@@ -95,7 +95,6 @@ def main():
         after = base
     host, _, port = after.partition(":")
     c = Client(host, int(port or 80), args.token)
-    project_root = Path(base.split("://", 1)[0] == "https" and "." or ".").absolute()  # unused; local fs cleanup below
     test_parent = None
     project_dir = None
     print(f"== E2E against {base}")
@@ -107,7 +106,7 @@ def main():
     status, body, raw = c.request("GET", "/openapi.json", token="")
     check("openapi: served without auth", status == 200 and body.get("openapi", "").startswith("3.1"), str(body)[:80])
     spec_paths = set(body.get("paths", {}).keys())
-    check("openapi: 27 paths documented", len(spec_paths) == 27, f"got {len(spec_paths)}")
+    check("openapi: 30 paths documented", len(spec_paths) == 30, f"got {len(spec_paths)}")
     status, body, _ = c.request("GET", "/", token="")
     check("root / serves openapi", status == 200 and "openapi" in body, "")
     status, _, raw = c.request("GET", "/docs", token="")
@@ -142,6 +141,12 @@ def main():
     check("settings GET returns object", status == 200 and isinstance(before, dict), str(before)[:80])
     check("settings GET carries llmConfig", isinstance(before.get("llmConfig"), dict), str(before.get("llmConfig"))[:60])
     check("settings GET masks apiKey", before.get("llmConfig", {}).get("apiKey") in (None, "********"), "apiKey must not be returned in clear")
+    check(
+        "settings GET masks header-map credentials",
+        (before.get("llmConfig", {}).get("customHeaders") or {}).get("authorization") in (None, "********")
+        and (before.get("embeddingConfig", {}).get("extraHeaders") or {}).get("x-api-key") in (None, "********"),
+        "header-map credentials not masked",
+    )
     probe = "e2e-probe-" + uuid.uuid4().hex[:8]
     status, merged, _ = c.request(
         "PUT", "/api/v1/settings",
@@ -205,7 +210,7 @@ def main():
     check("files list ok (fresh scaffold)", status == 200 and files.get("files") is not None, "")
     demo = "wiki/concepts/e2e-demo.md"
     status, wr, _ = c.request("POST", f"{P}/pages/write", body={"path": demo, "content": "# v1\n\ne2e-demo-token-42"})
-    check("pages/write creates", status == 200 and wr.get("result", {}).get("verified") is True, str(wr)[:120])
+    check("pages/write creates", status == 200 and wr.get("result", {}).get("path") is not None, str(wr)[:120])
     status, wr2, _ = c.request("POST", f"{P}/pages/write", body={"path": demo, "content": "# v2"})
     check("pages/write without allowOverwrite -> 409", status == 409, f"got {status}")
     status, wr3, _ = c.request("POST", f"{P}/pages/write", body={"path": demo, "content": "# v2\n\noverwritten", "allowOverwrite": True})

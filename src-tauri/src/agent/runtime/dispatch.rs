@@ -602,4 +602,3 @@ pub(crate) fn tool_emit_event(
     }
     tool_events.push(tool_event);
 }
-

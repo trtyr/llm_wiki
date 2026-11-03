@@ -1,5 +1,3 @@
-
-
 /// Frontend-facing search result shape. The Rust Agent uses
 /// `AgentReference` internally, but UI/deep-research code historically
 /// consumes `{ title, url, snippet, source }`; keep that wire contract

@@ -293,7 +293,9 @@ pub async fn load_explicit_context_files(
                 .any(|part| !matches!(part, Component::Normal(_)))
             || normalized.split('/').any(|part| part.starts_with('.'))
         {
-            eprintln!("[context] skipped context file '{normalized}': not a relative in-project path");
+            eprintln!(
+                "[context] skipped context file '{normalized}': not a relative in-project path"
+            );
             continue;
         }
         let candidate = root.join(relative);
@@ -302,7 +304,9 @@ pub async fn load_explicit_context_files(
             continue;
         };
         if !candidate_canon.starts_with(&root_canon) || !candidate_canon.is_file() {
-            eprintln!("[context] skipped context file '{normalized}': outside project or not a file");
+            eprintln!(
+                "[context] skipped context file '{normalized}': outside project or not a file"
+            );
             continue;
         }
         // Reuse the application's canonical reader so @ attachments support

@@ -15,16 +15,15 @@ use serde_json::{json, Map, Value};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 use uuid::Uuid;
 
-
-use crate::api_graph::{invalidate_graph_cache, load_graph, select_graph_page};
-use crate::api_sse::{send_terminal_sse, sse_frame, try_send_sse, SseReader, SseSendResult};
 #[cfg(test)]
 use crate::api_graph::{build_graph, graph_aliases, resolve_link, ApiGraphEdge, ApiGraphNode};
-#[cfg(test)]
-use std::sync::Arc;
+use crate::api_graph::{invalidate_graph_cache, load_graph, select_graph_page};
+use crate::api_sse::{send_terminal_sse, sse_frame, try_send_sse, SseReader, SseSendResult};
 use crate::cors::{local_cors_headers, request_origin};
 use crate::server_host::ServerHost;
 use crate::{agent, commands, project_registry, server_bind};
+#[cfg(test)]
+use std::sync::Arc;
 
 mod params;
 mod projects;
@@ -37,31 +36,37 @@ use projects::{
 
 mod reviews;
 
-use reviews::{handle_bulk_resolve_reviews, handle_delete_review, handle_patch_review, handle_reviews};
 #[cfg(test)]
 use reviews::{
     delete_review_item, load_review_items, normalize_review_title, parse_review_query,
     patch_review_item, resolve_review_items, review_id_for_parts, BulkResolveRequest,
 };
+use reviews::{
+    handle_bulk_resolve_reviews, handle_delete_review, handle_patch_review, handle_reviews,
+};
 mod respond;
 
-use respond::{allow_request, err, err_internal, ok, respond_error, respond_json, respond_options,
-              should_rate_limit, ApiResponse};
-use router::{cors_headers, process_request};
 #[cfg(test)]
 use auth::constant_time_eq;
 #[cfg(test)]
 use projects::project_path_matches;
+use respond::{
+    allow_request, err, err_internal, ok, respond_error, respond_json, respond_options,
+    should_rate_limit, ApiResponse,
+};
 #[cfg(test)]
 use router::{body_limit_for_request, is_token_required_request, wants_streaming_chat};
+use router::{cors_headers, process_request};
 
-use params::{percent_decode, split_url};
 pub(crate) use params::parse_query;
+use params::{percent_decode, split_url};
 
 mod auth;
 
-use auth::{api_allow_lan_access, api_allow_unauthenticated, api_auth_required, api_enabled,
-          api_mcp_enabled, api_token, api_token_source, is_authorized, is_token_authorized};
+use auth::{
+    api_allow_lan_access, api_allow_unauthenticated, api_auth_required, api_enabled,
+    api_mcp_enabled, api_token, api_token_source, is_authorized, is_token_authorized,
+};
 
 const API_PREFIX: &str = "/api/v1";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -98,7 +103,6 @@ struct CachedAppState {
     loaded_at: Instant,
     value: Option<Value>,
 }
-
 
 pub fn get_api_status() -> &'static str {
     match API_STATUS.load(Ordering::Relaxed) {
@@ -191,8 +195,11 @@ fn ensure_project_identity(path: &str, name: &str) -> Result<String, String> {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let tmp = meta_dir.join(format!("project.json.{}-{nanos}.tmp", std::process::id()));
-    fs::write(&tmp, serde_json::to_string_pretty(&payload).unwrap_or_default())
-        .map_err(|e| format!("failed to write {}: {e}", file.display()))?;
+    fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+    )
+    .map_err(|e| format!("failed to write {}: {e}", file.display()))?;
     if let Err(e) = fs::rename(&tmp, &file) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("failed to finalize {}: {e}", file.display()));
@@ -341,8 +348,16 @@ fn load_app_state(app: &ServerHost) -> Option<Value> {
         // happened" becomes undebuggable (F-11).
         eprintln!(
             "[api] app-state.json unreadable or corrupt{}; config reads fall back{}",
-            if previous.is_some() { " - serving previous cached value" } else { "" },
-            if previous.is_some() { " to cache" } else { " to empty" },
+            if previous.is_some() {
+                " - serving previous cached value"
+            } else {
+                ""
+            },
+            if previous.is_some() {
+                " to cache"
+            } else {
+                " to empty"
+            },
         );
     }
     let value = loaded.or(previous);
@@ -396,7 +411,8 @@ fn handle_delete_file(app: &ServerHost, project_id: &str, query: &str) -> ApiRes
     if !path.is_file() {
         return err(404, format!("File not found: {rel}"));
     }
-    let history_recorded = commands::file_history::record_file_version(&path, "api", "api.files.delete");
+    let history_recorded =
+        commands::file_history::record_file_version(&path, "api", "api.files.delete");
     if let Err(e) = fs::remove_file(&path) {
         return err_internal("file delete", e);
     }
@@ -527,8 +543,7 @@ fn handle_files(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse 
     };
     if rel.is_empty() {
         let mut count = 0;
-        return match list_public_roots(&project.path, recursive, max_files, &mut count)
-        {
+        return match list_public_roots(&project.path, recursive, max_files, &mut count) {
             Ok(files) => ok(json!({
                 "ok": true,
                 "projectId": project.id,
@@ -742,22 +757,18 @@ fn handle_search(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse 
     // response's `warnings` array; the provider error detail stays in the
     // server log.
     let mut warnings: Vec<String> = Vec::new();
-    let query_embedding =
-        match app.block_on(commands::search::resolve_query_embedding(
-            &query,
-            req.query_embedding,
-            load_embedding_config(app),
-        )) {
-            Ok(embedding) => embedding,
-            Err(e) => {
-                eprintln!(
-                    "[api] query embedding unavailable, falling back to keyword-only: {e}"
-                );
-                warnings
-                    .push("embedding provider unavailable — results are keyword-only".to_string());
-                None
-            }
-        };
+    let query_embedding = match app.block_on(commands::search::resolve_query_embedding(
+        &query,
+        req.query_embedding,
+        load_embedding_config(app),
+    )) {
+        Ok(embedding) => embedding,
+        Err(e) => {
+            eprintln!("[api] query embedding unavailable, falling back to keyword-only: {e}");
+            warnings.push("embedding provider unavailable — results are keyword-only".to_string());
+            None
+        }
+    };
     match app.block_on(commands::search::search_project_inner(
         project.path.clone(),
         query,
@@ -850,9 +861,7 @@ fn prepare_chat(
     let persist_session = req.persist_session;
     let session_id = req.session_id.clone().unwrap_or_default();
     let run_id = req.run_id.clone().unwrap_or_default();
-    let cancellation = app
-        .cancellations()
-        .start(&project.id, &session_id, &run_id);
+    let cancellation = app.cancellations().start(&project.id, &session_id, &run_id);
     Ok(PreparedChat {
         project,
         request: req,
@@ -1067,8 +1076,7 @@ fn respond_chat_sse(
                 // aggregate response, so correctness is preserved - but the
                 // gap is now counted and logged instead of invisible (F-43).
                 SseSendResult::Full => {
-                    let dropped =
-                        SSE_DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    let dropped = SSE_DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!(
                         "[api] SSE queue full; dropped agent event #{dropped} (run {cancel_run})"
                     );
@@ -1083,9 +1091,11 @@ fn respond_chat_sse(
             ))
             .catch_unwind()
             .await;
-        task_app
-            .cancellations()
-            .finish(&prepared.project.id, &prepared.session_id, &prepared.run_id);
+        task_app.cancellations().finish(
+            &prepared.project.id,
+            &prepared.session_id,
+            &prepared.run_id,
+        );
         match result {
             Ok(Ok(response)) => {
                 if !persist_chat_response(&task_app, &prepared, &response) {
@@ -1557,12 +1567,25 @@ const SECRET_MASK: &str = "********";
 fn is_sensitive_key(lower: &str) -> bool {
     matches!(
         lower,
-        "apikey" | "api_key" | "api-key"
-            | "token" | "accesstoken" | "access_token" | "access-token"
-            | "authorization" | "proxy-authorization"
-            | "x-api-key" | "x-goog-api-key" | "x-subscription-token"
-            | "secret" | "clientsecret" | "client_secret" | "client-secret"
-            | "password" | "privatekey" | "private_key"
+        "apikey"
+            | "api_key"
+            | "api-key"
+            | "token"
+            | "accesstoken"
+            | "access_token"
+            | "access-token"
+            | "authorization"
+            | "proxy-authorization"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "x-subscription-token"
+            | "secret"
+            | "clientsecret"
+            | "client_secret"
+            | "client-secret"
+            | "password"
+            | "privatekey"
+            | "private_key"
     )
 }
 
@@ -1618,9 +1641,7 @@ fn strip_mask_leaves(value: &Value) -> Value {
 /// - the secret mask `"********"` keeps the existing value (round-trip
 ///   safe: masked GET output can be PUT back without leaking or losing keys)
 fn deep_merge_masked(existing: &mut Value, update: &Value) {
-    if let (Some(existing_map), Some(update_map)) =
-        (existing.as_object_mut(), update.as_object())
-    {
+    if let (Some(existing_map), Some(update_map)) = (existing.as_object_mut(), update.as_object()) {
         for (key, update_value) in update_map {
             if update_value.is_null() {
                 existing_map.remove(key);
@@ -1670,7 +1691,10 @@ fn handle_create_project(app: &ServerHost, body: &str) -> ApiResponse {
         return err(400, "name is too long (max 120 characters)");
     }
     if name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') {
-        return err(400, "invalid name: use a single path component without '..' or leading dots");
+        return err(
+            400,
+            "invalid name: use a single path component without '..' or leading dots",
+        );
     }
     let parent = std::path::Path::new(req.path.trim());
     match fs::metadata(parent) {
@@ -1693,7 +1717,10 @@ fn handle_create_project(app: &ServerHost, body: &str) -> ApiResponse {
     };
     let registered = persist_project_registration(app, &project_id, name, &project.path);
     if !registered {
-        eprintln!("[api] project {} created on disk but registration did not persist", project_id);
+        eprintln!(
+            "[api] project {} created on disk but registration did not persist",
+            project_id
+        );
     }
     invalidate_graph_cache(&project.path);
     ok(json!({
@@ -1797,14 +1824,20 @@ fn handle_list_file_history(app: &ServerHost, project_id: &str, query: &str) -> 
 /// rejected — pass the explicit project id.
 fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse {
     if project_id.eq_ignore_ascii_case("current") {
-        return err(400, "refusing to delete by 'current' — pass the explicit project id");
+        return err(
+            400,
+            "refusing to delete by 'current' — pass the explicit project id",
+        );
     }
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
         Err(e) => return err(404, e),
     };
     let params = parse_query(query);
-    let delete_files = params.get("deleteFiles").map(|v| v == "true").unwrap_or(false);
+    let delete_files = params
+        .get("deleteFiles")
+        .map(|v| v == "true")
+        .unwrap_or(false);
     if delete_files {
         // Recursive disk removal needs a second, explicit confirmation
         // naming the directory (F-18): a stale client or mistyped URL must
@@ -1816,7 +1849,9 @@ fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> Api
         if params.get("confirm").map(String::as_str) != Some(dir_name) {
             return err(
                 400,
-                format!("deleteFiles=true requires confirm={dir_name} (the project directory name)"),
+                format!(
+                    "deleteFiles=true requires confirm={dir_name} (the project directory name)"
+                ),
             );
         }
     }
@@ -1828,15 +1863,19 @@ fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> Api
         let path_norm = normalize_path(&project.path);
         let result = update_app_state_file(&store, |merged| {
             if let Some(map) = merged.as_object_mut() {
-                if let Some(reg) =
-                    map.get_mut("projectRegistry").and_then(Value::as_object_mut)
+                if let Some(reg) = map
+                    .get_mut("projectRegistry")
+                    .and_then(Value::as_object_mut)
                 {
                     reg.remove(&project.id);
                     let stale: Vec<String> = reg
                         .iter()
                         .filter(|(_, v)| {
-                            v.get("path").and_then(Value::as_str)
-                                .map(|p| normalize_path(p)).as_deref() == Some(path_norm.as_str())
+                            v.get("path")
+                                .and_then(Value::as_str)
+                                .map(|p| normalize_path(p))
+                                .as_deref()
+                                == Some(path_norm.as_str())
                         })
                         .map(|(k, _)| k.clone())
                         .collect();
@@ -1844,12 +1883,13 @@ fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> Api
                         reg.remove(&k);
                     }
                 }
-                if let Some(recents) =
-                    map.get_mut("recentProjects").and_then(Value::as_array_mut)
-                {
+                if let Some(recents) = map.get_mut("recentProjects").and_then(Value::as_array_mut) {
                     recents.retain(|v| {
-                        v.get("path").and_then(Value::as_str)
-                            .map(|p| normalize_path(p)).as_deref() != Some(path_norm.as_str())
+                        v.get("path")
+                            .and_then(Value::as_str)
+                            .map(|p| normalize_path(p))
+                            .as_deref()
+                            != Some(path_norm.as_str())
                     });
                 }
             }
@@ -1873,9 +1913,7 @@ fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> Api
     if delete_files && !project.path.is_empty() {
         match fs::remove_dir_all(&project.path) {
             Ok(()) => files_deleted = true,
-            Err(e) => {
-                return err_internal("project deleteFiles", e)
-            }
+            Err(e) => return err_internal("project deleteFiles", e),
         }
     }
 
@@ -1887,7 +1925,6 @@ fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> Api
         "filesDeleted": files_deleted,
     }))
 }
-
 
 /// POST /api/v1/projects/{id}/history/restore — body {path, entryId}.
 fn handle_restore_file_history(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse {
@@ -2277,11 +2314,20 @@ mod tests {
             "embeddingConfig": { "extraHeaders": { "x-api-key": "emb-1" } }
         });
         mask_secrets(&mut v);
-        assert_eq!(v["llmConfig"]["customHeaders"]["authorization"], SECRET_MASK);
+        assert_eq!(
+            v["llmConfig"]["customHeaders"]["authorization"],
+            SECRET_MASK
+        );
         assert_eq!(v["llmConfig"]["extraRequestBody"]["api_key"], SECRET_MASK);
-        assert_eq!(v["embeddingConfig"]["extraHeaders"]["x-api-key"], SECRET_MASK);
+        assert_eq!(
+            v["embeddingConfig"]["extraHeaders"]["x-api-key"],
+            SECRET_MASK
+        );
         // non-credential entries stay readable
-        assert_eq!(v["llmConfig"]["customHeaders"]["content-type"], "application/json");
+        assert_eq!(
+            v["llmConfig"]["customHeaders"]["content-type"],
+            "application/json"
+        );
         assert_eq!(v["llmConfig"]["extraRequestBody"]["temperature"], 0.5);
     }
 
@@ -2328,7 +2374,10 @@ mod tests {
                     let key = format!("thread{t}k{i}");
                     let path = shared.clone();
                     let res = update_app_state_file(&path, move |merged| {
-                        merged.as_object_mut().unwrap().insert(key.clone(), json!(i));
+                        merged
+                            .as_object_mut()
+                            .unwrap()
+                            .insert(key.clone(), json!(i));
                         true
                     });
                     assert!(res.is_ok());
@@ -2342,7 +2391,11 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         for t in 0..4 {
             for i in 0..10 {
-                assert_eq!(v[format!("thread{t}k{i}")], json!(i), "lost update t{t}k{i}");
+                assert_eq!(
+                    v[format!("thread{t}k{i}")],
+                    json!(i),
+                    "lost update t{t}k{i}"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -2360,20 +2413,32 @@ mod tests {
             commands::vectorstore::canonical_page_id("wiki//deep/Page.md").as_deref(),
             Some("deep/Page")
         );
-        assert_eq!(commands::vectorstore::canonical_page_id("raw/sources/a.pdf"), None);
-        assert_eq!(commands::vectorstore::canonical_page_id("wiki/nope.txt"), None);
+        assert_eq!(
+            commands::vectorstore::canonical_page_id("raw/sources/a.pdf"),
+            None
+        );
+        assert_eq!(
+            commands::vectorstore::canonical_page_id("wiki/nope.txt"),
+            None
+        );
     }
 
     // F-33: a query longer than the body (title hit, tiny body) must not
     // underflow the search loop - it simply finds no match.
     #[test]
     fn snippet_handles_query_longer_than_content() {
-        let snippet = commands::search::build_snippet("TODO
-", "coal mine safety regulation");
+        let snippet = commands::search::build_snippet(
+            "TODO
+",
+            "coal mine safety regulation",
+        );
         assert!(snippet.contains("TODO"));
         // Multi-byte content shorter than the query must be safe too.
-        let snippet = commands::search::build_snippet("采
-", "煤矿安全规程全文检索");
+        let snippet = commands::search::build_snippet(
+            "采
+",
+            "煤矿安全规程全文检索",
+        );
         assert!(snippet.contains("采"));
     }
 
@@ -2951,7 +3016,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn paid_or_mutating_agent_routes_always_require_a_token() {
         assert!(is_token_required_request(
@@ -2970,10 +3034,7 @@ mod tests {
             &Method::Delete,
             "/api/v1/projects/current/files/content?path=wiki/x.md"
         ));
-        assert!(is_token_required_request(
-            &Method::Put,
-            "/api/v1/settings"
-        ));
+        assert!(is_token_required_request(&Method::Put, "/api/v1/settings"));
         assert!(is_token_required_request(
             &Method::Post,
             "/api/v1/projects/create"
@@ -3114,10 +3175,7 @@ mod tests {
         // Exercises the production api_enabled/api_allow_unauthenticated/
         // api_mcp_enabled readers against a temp app-state.json so a
         // production regression fails here instead of surfacing as a 503.
-        let dir = std::env::temp_dir().join(format!(
-            "llm-wiki-apicfg-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("llm-wiki-apicfg-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let store = dir.join("app-state.json");
         fs::write(
@@ -3146,7 +3204,12 @@ mod tests {
         assert!(api_mcp_enabled(&host));
 
         // Defaults with no config file at all.
-        let empty = ServerHost::new(None, Default::default(), Default::default(), rt.handle().clone());
+        let empty = ServerHost::new(
+            None,
+            Default::default(),
+            Default::default(),
+            rt.handle().clone(),
+        );
         assert!(api_enabled(&empty));
         assert!(!api_allow_unauthenticated(&empty));
 
@@ -3252,9 +3315,21 @@ mod tests {
             session_id: "sess-1".to_string(),
             project_id: "proj".to_string(),
             messages: vec![
-                agent::session::AgentSessionMessage { role: "user".into(), content: "q1".into(), timestamp: 1 },
-                agent::session::AgentSessionMessage { role: "assistant".into(), content: "a1".into(), timestamp: 2 },
-                agent::session::AgentSessionMessage { role: "user".into(), content: "q2".into(), timestamp: 3 },
+                agent::session::AgentSessionMessage {
+                    role: "user".into(),
+                    content: "q1".into(),
+                    timestamp: 1,
+                },
+                agent::session::AgentSessionMessage {
+                    role: "assistant".into(),
+                    content: "a1".into(),
+                    timestamp: 2,
+                },
+                agent::session::AgentSessionMessage {
+                    role: "user".into(),
+                    content: "q2".into(),
+                    timestamp: 3,
+                },
             ],
             updated_at: 42,
         };

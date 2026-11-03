@@ -168,9 +168,7 @@ fn load_session(project_path: &str, session_id: &str) -> Option<AgentSession> {
         Err(err) => {
             // A corrupt session file must not silently look like a brand-new
             // chat: surface it so the operator knows history was dropped.
-            eprintln!(
-                "[session] corrupt session file {session_id} in {project_path}: {err}"
-            );
+            eprintln!("[session] corrupt session file {session_id} in {project_path}: {err}");
             None
         }
     }
@@ -210,9 +208,7 @@ fn prune_sessions(project_path: &str) {
             eprintln!("[session] prune failed for {}: {err}", path.display());
         }
     }
-    eprintln!(
-        "[session] pruned {excess} old session files (cap {MAX_PERSISTED_SESSIONS})"
-    );
+    eprintln!("[session] pruned {excess} old session files (cap {MAX_PERSISTED_SESSIONS})");
 }
 
 fn save_session(project_path: &str, session: &AgentSession) -> Result<(), String> {
@@ -394,9 +390,7 @@ mod tests {
     #[test]
     fn prune_sessions_caps_the_session_directory() {
         let project = temp_project("prune");
-        let dir = project
-            .join(".llm-wiki")
-            .join("agent-sessions");
+        let dir = project.join(".llm-wiki").join("agent-sessions");
         fs::create_dir_all(&dir).unwrap();
         for idx in 0..(MAX_PERSISTED_SESSIONS + 10) {
             let file = dir.join(format!("sess-{idx:04}.json"));

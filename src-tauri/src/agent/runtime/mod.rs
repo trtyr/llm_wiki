@@ -19,8 +19,8 @@ use super::events::AgentEvent;
 use super::permissions::{AgentCapability, PermissionPolicy};
 use super::provider::{AgentLlmProvider, LlmClient, LlmConfig};
 use super::router::route_query;
-use super::skills::{load_project_skills, AgentSkill};
 use super::shell_policy::{is_shell_command_allowed_without_prompt, is_shell_command_approved};
+use super::skills::{load_project_skills, AgentSkill};
 use super::tools::{self, AnyTxtConfig, ToolRegistry, WebSearchConfig};
 use super::types::{
     AgentChatRequest, AgentChatResponse, AgentMode, AgentReference, AgentRetrievalMode,
@@ -30,12 +30,12 @@ use super::types::{
 mod dispatch;
 mod planner;
 
+use super::workspace::agent_workspace_display;
 use dispatch::{emit_event, tool_emit_event};
 use planner::{
     escape_planner_xml, extract_json_object, parse_model_tool_plan, planned_tool_queries,
     shell_command_from_call, should_plan_tools_with_model, ModelToolPlan,
 };
-use super::workspace::agent_workspace_display;
 
 // These limits are intentionally enforced in the backend Agent rather than the
 // React UI. API and MCP callers bypass the UI, so safety and cost boundaries
@@ -64,7 +64,6 @@ pub struct AgentRuntime {
     web_search_config: Option<WebSearchConfig>,
     anytxt_config: Option<AnyTxtConfig>,
 }
-
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1866,23 +1865,41 @@ impl AgentRuntime {
             return Ok(ModelToolPlan::default());
         };
         check_cancel(cancellation)?;
-        let mut available = vec![
-            "wiki.search",
-            "source.search",
-            "graph.search",
-            "wiki.write_page",
+        // Derived from the tool contract itself (F-50): the hand-written
+        // list used to drift independently of builtin_tool_specs. The
+        // planner offers the registered loop tools, filtered by the
+        // request's capability switches. Not offered from specs:
+        // deep_research.run / llm.generate (not loop tools), and
+        // wiki.read_page / workspace.append_file (not part of the planner
+        // surface). skill.read_file is skill-system-provided, not builtin.
+        const PLANNER_EXCLUDED: [&str; 4] = [
+            "deep_research.run",
+            "llm.generate",
+            "wiki.read_page",
+            "workspace.append_file",
         ];
-        if tools.web {
-            available.push("web.search");
-        }
-        if tools.anytxt {
-            available.push("anytxt.search");
-        }
+        const SKILLS_TOOLS: [&str; 2] = ["workspace.write_file", "shell.exec"];
+        let gated = [("web.search", tools.web), ("anytxt.search", tools.anytxt)];
+        let specs = tools::builtin_tool_specs();
+        let mut available: Vec<&str> = specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .filter(|name| !PLANNER_EXCLUDED.contains(name))
+            .filter(|name| {
+                let (tool, enabled) = gated
+                    .iter()
+                    .find(|(tool, _)| tool == name)
+                    .copied()
+                    .unwrap_or((name, true));
+                let _ = tool;
+                enabled
+            })
+            .filter(|name| skills_enabled || !SKILLS_TOOLS.contains(name))
+            .collect();
         if skills_enabled {
             available.push("skill.read_file");
-            available.push("workspace.write_file");
-            available.push("shell.exec");
         }
+        available.sort_unstable();
         let system = "You are an agent tool planner. Return only compact JSON. Do not explain.";
         let skill_context = render_skill_planner_context(skills, skill_mode);
         let workspace = agent_workspace_display(&self.project_path);
@@ -2192,7 +2209,6 @@ fn is_safe_relative_skill_path(path: &str) -> bool {
             .components()
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
-
 
 fn project_context_for_retrieval_mode(
     mut project: super::context::ProjectContext,
@@ -3310,7 +3326,6 @@ mod tests {
         assert!(!error.contains("Router intent="));
     }
 
-
     #[tokio::test]
     async fn run_once_rejects_empty_message() {
         let project = temp_project("empty");
@@ -4368,6 +4383,21 @@ mod tests {
                 .unwrap_err()
                 .contains("faithful-source mode"));
         }
+    }
+
+    // F-41/F-10: the shell channel must refuse at the permission gate with
+    // the default API policy (Process is not granted), even when the
+    // request body carries its own "approved" commands - approval is not
+    // self-certifying.
+    #[test]
+    fn shell_exec_refused_by_default_policy_despite_self_approved_commands() {
+        let request: AgentChatRequest =
+            serde_json::from_str(r#"{"message":"x","approvedShellCommands":["echo hacked"]}"#)
+                .unwrap();
+        let policy = crate::agent::permissions::PermissionPolicy::api_default();
+        assert!(!policy.allows(crate::agent::permissions::AgentCapability::Process));
+        assert!(require_tool_permission("shell.exec", &request, &policy).is_err());
+        assert!(require_tool_permission("wiki.search", &request, &policy).is_ok());
     }
 
     #[test]

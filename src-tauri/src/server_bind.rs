@@ -55,9 +55,7 @@ fn parse_port_value(env_key: &str, raw: &str) -> Option<u16> {
     match raw.parse::<u16>() {
         Ok(port @ 1..=65535) => Some(port),
         _ => {
-            eprintln!(
-                "[server-bind] ignoring invalid {env_key} value {raw:?} (expected 1-65535)"
-            );
+            eprintln!("[server-bind] ignoring invalid {env_key} value {raw:?} (expected 1-65535)");
             None
         }
     }
@@ -98,9 +96,7 @@ fn allow_lan_access_from_state(value: &Value) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::{
-        allow_lan_access_from_state, bind_addr, parse_port_value, sanitize_bind_host,
-    };
+    use super::{allow_lan_access_from_state, bind_addr, parse_port_value, sanitize_bind_host};
 
     #[test]
     fn sanitize_bind_host_accepts_common_lan_hosts() {

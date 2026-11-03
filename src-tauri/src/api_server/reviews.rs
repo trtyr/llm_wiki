@@ -96,7 +96,10 @@ pub(super) fn review_id_matches(item: &Value, requested_id: &str) -> bool {
         || stable_review_id(item).as_deref() == Some(requested_id)
 }
 
-pub(super) fn load_review_items(project_path: &str, query: &ReviewQuery) -> Result<Vec<Value>, String> {
+pub(super) fn load_review_items(
+    project_path: &str,
+    query: &ReviewQuery,
+) -> Result<Vec<Value>, String> {
     let path = Path::new(project_path).join(".llm-wiki/review.json");
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -261,7 +264,10 @@ pub(super) fn merge_string_array_field(
     }
 }
 
-pub(super) fn merge_review_options_field(existing: &mut Map<String, Value>, incoming: &Map<String, Value>) {
+pub(super) fn merge_review_options_field(
+    existing: &mut Map<String, Value>,
+    incoming: &Map<String, Value>,
+) {
     let mut options = existing
         .get("options")
         .and_then(Value::as_array)
@@ -362,7 +368,10 @@ pub(super) fn handle_reviews(app: &ServerHost, project_id: &str, query: &str) ->
             "count": reviews.len(),
             "reviews": reviews,
         })),
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => {
+            eprintln!("[api] 500: {e}");
+            err(500, e)
+        }
     }
 }
 
@@ -389,7 +398,9 @@ pub(super) fn handle_patch_review(
 ) -> ApiResponse {
     // Serialize the read-modify-write cycle against concurrent
     // PATCH/DELETE/bulk-resolve requests.
-    let _review_guard = REVIEW_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _review_guard = REVIEW_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
         Err(e) => return err(404, e),
@@ -414,7 +425,10 @@ pub(super) fn handle_patch_review(
             "resolved": resolved,
         })),
         Ok(false) => err(404, format!("Review item '{review_id}' not found")),
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => {
+            eprintln!("[api] 500: {e}");
+            err(500, e)
+        }
     }
 }
 
@@ -428,8 +442,14 @@ pub(super) struct BulkResolveRequest {
     pub(super) action: Option<String>,
 }
 
-pub(super) fn handle_delete_review(app: &ServerHost, project_id: &str, review_id: &str) -> ApiResponse {
-    let _review_guard = REVIEW_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+pub(super) fn handle_delete_review(
+    app: &ServerHost,
+    project_id: &str,
+    review_id: &str,
+) -> ApiResponse {
+    let _review_guard = REVIEW_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
         Err(e) => return err(404, e),
@@ -442,7 +462,10 @@ pub(super) fn handle_delete_review(app: &ServerHost, project_id: &str, review_id
             "deleted": true,
         })),
         Ok(false) => err(404, format!("Review item '{review_id}' not found")),
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => {
+            eprintln!("[api] 500: {e}");
+            err(500, e)
+        }
     }
 }
 
@@ -469,8 +492,14 @@ pub(super) fn delete_review_item(project_path: &str, review_id: &str) -> Result<
 /// normal, so this returns 200 with `{ resolved, notFound, count }`
 /// rather than 404 — 404 is reserved for the single-item PATCH where
 /// one unknown id is the entire request.
-pub(super) fn handle_bulk_resolve_reviews(app: &ServerHost, project_id: &str, body: &str) -> ApiResponse {
-    let _review_guard = REVIEW_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+pub(super) fn handle_bulk_resolve_reviews(
+    app: &ServerHost,
+    project_id: &str,
+    body: &str,
+) -> ApiResponse {
+    let _review_guard = REVIEW_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
         Err(e) => return err(404, e),
@@ -490,7 +519,10 @@ pub(super) fn handle_bulk_resolve_reviews(app: &ServerHost, project_id: &str, bo
             "notFound": not_found,
             "count": resolved.len(),
         })),
-        Err(e) => { eprintln!("[api] 500: {e}"); err(500, e) },
+        Err(e) => {
+            eprintln!("[api] 500: {e}");
+            err(500, e)
+        }
     }
 }
 
@@ -639,4 +671,3 @@ pub(super) fn write_raw_review_array(path: &Path, parsed: &Value) -> Result<(), 
         format!("Failed to replace review state: {err}")
     })
 }
-

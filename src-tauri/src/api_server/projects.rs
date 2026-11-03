@@ -348,4 +348,3 @@ pub(super) struct ReviewQuery {
     pub(super) item_type: Option<String>,
     pub(super) limit: usize,
 }
-

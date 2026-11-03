@@ -335,8 +335,9 @@ pub struct VerifiedWikiWriteOutput {
     pub path: String,
     pub bytes: usize,
     pub allow_overwrite: bool,
-    pub verified: bool,
     pub existed_before: bool,
+    // (verified removed, F-29: it was a constant true - verification
+    // failure surfaces as Err, so the field carried no information.)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -668,7 +669,6 @@ pub fn write_wiki_page_verified(
         path: output.reference.path,
         bytes: content.len(),
         allow_overwrite,
-        verified: true,
         existed_before: output.existed_before,
     })
 }
@@ -2528,19 +2528,17 @@ pub fn search_sources(
             // first use now.
             match crate::commands::fs::read_preprocessed_cache(entry.path()) {
                 Some(content) => content,
-                None => {
-                    match crate::commands::fs::preprocess_file_sync(entry.path()) {
-                        Ok(text) if text != "no preprocessing needed" => text,
-                        Ok(_) => continue,
-                        Err(err) => {
-                            eprintln!(
-                                "[source.search] preprocessing {} failed: {err}",
-                                entry.path().display()
-                            );
-                            continue;
-                        }
+                None => match crate::commands::fs::preprocess_file_sync(entry.path()) {
+                    Ok(text) if text != "no preprocessing needed" => text,
+                    Ok(_) => continue,
+                    Err(err) => {
+                        eprintln!(
+                            "[source.search] preprocessing {} failed: {err}",
+                            entry.path().display()
+                        );
+                        continue;
                     }
-                }
+                },
             }
         } else {
             continue;
@@ -3377,7 +3375,6 @@ mod tests {
         .unwrap();
         assert_eq!(verified.path, "wiki/queries/verified.md");
         assert_eq!(verified.bytes, "# Verified\n".len());
-        assert!(verified.verified);
         assert!(!verified.existed_before);
         let _ = fs::remove_dir_all(root);
     }

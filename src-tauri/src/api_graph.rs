@@ -3,10 +3,10 @@
 //! Extracted from api_server: pure graph engine (no HTTP types). The
 //! route handler stays in api_server and calls load_graph/select_graph_page.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -53,7 +53,6 @@ pub(crate) struct GraphPage {
     pub(crate) total_count: usize,
     pub(crate) has_more: bool,
 }
-
 
 pub(crate) fn select_graph_page(
     nodes: &[ApiGraphNode],
@@ -159,7 +158,9 @@ pub(crate) fn graph_files(project_path: &str) -> Result<(u64, Vec<PathBuf>), Str
     let mut files = Vec::new();
     // Traversal errors used to drop files from the graph silently (F-52).
     for entry in WalkDir::new(&wiki_root).into_iter().filter_map(|entry| {
-        entry.map_err(|err| eprintln!("[graph] walk error under {}: {err}", wiki_root.display())).ok()
+        entry
+            .map_err(|err| eprintln!("[graph] walk error under {}: {err}", wiki_root.display()))
+            .ok()
     }) {
         if entry.file_type().is_file()
             && entry
@@ -185,7 +186,10 @@ pub(crate) fn graph_files(project_path: &str) -> Result<(u64, Vec<PathBuf>), Str
             // this page while a cached graph is alive - at least say why
             // a stale graph may linger (F-52).
             Err(err) => {
-                eprintln!("[graph] metadata failed for {} (fingerprint degraded): {err}", path.display());
+                eprintln!(
+                    "[graph] metadata failed for {} (fingerprint degraded): {err}",
+                    path.display()
+                );
             }
         }
     }
@@ -193,7 +197,9 @@ pub(crate) fn graph_files(project_path: &str) -> Result<(u64, Vec<PathBuf>), Str
 }
 
 #[cfg(test)]
-pub(crate) fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
+pub(crate) fn build_graph(
+    project_path: &str,
+) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
     let (_, files) = graph_files(project_path)?;
     build_graph_from_files(project_path, &files)
 }
@@ -302,7 +308,9 @@ pub(crate) struct GraphAliases {
     pub(crate) titles: HashMap<String, Option<String>>,
 }
 
-pub(crate) fn graph_aliases(raw: &BTreeMap<String, (String, String, String, Vec<String>)>) -> GraphAliases {
+pub(crate) fn graph_aliases(
+    raw: &BTreeMap<String, (String, String, String, Vec<String>)>,
+) -> GraphAliases {
     let mut aliases = GraphAliases {
         exact_ids: HashMap::new(),
         ids: HashMap::new(),
@@ -325,7 +333,11 @@ pub(crate) fn graph_aliases(raw: &BTreeMap<String, (String, String, String, Vec<
     aliases
 }
 
-pub(crate) fn insert_graph_alias(aliases: &mut HashMap<String, Option<String>>, keys: Vec<String>, id: &str) {
+pub(crate) fn insert_graph_alias(
+    aliases: &mut HashMap<String, Option<String>>,
+    keys: Vec<String>,
+    id: &str,
+) {
     for key in keys {
         match aliases.get(&key) {
             None => {
@@ -415,4 +427,3 @@ pub(crate) fn invalidate_graph_cache(project_path: &str) {
         }
     }
 }
-
