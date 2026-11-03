@@ -157,7 +157,10 @@ pub(crate) fn load_graph(project_path: &str) -> Result<Arc<CachedGraph>, String>
 pub(crate) fn graph_files(project_path: &str) -> Result<(u64, Vec<PathBuf>), String> {
     let wiki_root = Path::new(project_path).join("wiki");
     let mut files = Vec::new();
-    for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
+    // Traversal errors used to drop files from the graph silently (F-52).
+    for entry in WalkDir::new(&wiki_root).into_iter().filter_map(|entry| {
+        entry.map_err(|err| eprintln!("[graph] walk error under {}: {err}", wiki_root.display())).ok()
+    }) {
         if entry.file_type().is_file()
             && entry
                 .path()
@@ -173,9 +176,17 @@ pub(crate) fn graph_files(project_path: &str) -> Result<(u64, Vec<PathBuf>), Str
     let mut hasher = DefaultHasher::new();
     for path in &files {
         path.hash(&mut hasher);
-        if let Ok(metadata) = fs::metadata(path) {
-            metadata.len().hash(&mut hasher);
-            metadata.modified().ok().hash(&mut hasher);
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                metadata.len().hash(&mut hasher);
+                metadata.modified().ok().hash(&mut hasher);
+            }
+            // Without len/mtime the fingerprint cannot detect edits to
+            // this page while a cached graph is alive - at least say why
+            // a stale graph may linger (F-52).
+            Err(err) => {
+                eprintln!("[graph] metadata failed for {} (fingerprint degraded): {err}", path.display());
+            }
         }
     }
     Ok((hasher.finish(), files))
@@ -202,7 +213,11 @@ pub(crate) fn build_graph_from_files(
     for path in files {
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
-            Err(_) => continue,
+            // An unreadable page disappears from the graph; say so (F-52).
+            Err(err) => {
+                eprintln!("[graph] skipping unreadable page {}: {err}", path.display());
+                continue;
+            }
         };
         let relative_id = wiki_page_id(&wiki_root, path);
         let stem = path

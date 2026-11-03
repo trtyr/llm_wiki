@@ -238,6 +238,9 @@ fn prune_entries_per_file(root: &Path, max_versions: usize) -> Result<(), String
 /// Returns whether a version was actually recorded. History is off by
 /// default (`enabled: false`), so callers must not claim restore safety
 /// without checking this.
+// All skip paths log their concrete reason: callers only see a bare
+// `false`, and seven different causes used to masquerade as "history is
+// disabled", pointing users at the wrong fix (F-20).
 pub fn record_file_version(path: &Path, author: &str, tool: &str) -> bool {
     let Some(root) = project_root_for(path) else {
         return false;
@@ -246,25 +249,36 @@ pub fn record_file_version(path: &Path, author: &str, tool: &str) -> bool {
         return false;
     }
     let Ok(_guard) = HISTORY_LOCK.lock() else {
+        eprintln!("[history] lock poisoned; skipping version for {}", path.display());
         return false;
     };
     let settings = read_history_settings(&root);
     if !settings.enabled || settings.max_versions_per_file == 0 {
-        return false;
+        return false; // genuinely disabled - the only case the API hint describes
     }
     let Ok(metadata) = fs::metadata(path) else {
+        eprintln!("[history] stat failed for {}: skipping version", path.display());
         return false;
     };
     if !metadata.is_file() || metadata.len() as usize > MAX_HISTORY_CONTENT_BYTES {
+        eprintln!(
+            "[history] {} not eligible (dir?, size {} > {}?)",
+            path.display(),
+            metadata.len(),
+            MAX_HISTORY_CONTENT_BYTES
+        );
         return false;
     }
     let Ok(content) = fs::read_to_string(path) else {
+        eprintln!("[history] read failed for {}: skipping version", path.display());
         return false;
     };
     let Ok(dir) = checked_history_dir(&root, true) else {
+        eprintln!("[history] history dir rejected (symlink?) for {}: skipping", path.display());
         return false;
     };
     let Ok(checked_store_path) = checked_history_file(&root, path) else {
+        eprintln!("[history] store path rejected for {}: skipping", path.display());
         return false;
     };
     let Some(file_name) = checked_store_path.file_name().map(ToOwned::to_owned) else {

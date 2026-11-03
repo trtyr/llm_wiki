@@ -221,8 +221,8 @@ pub(super) fn list_public_roots(
     project_path: &str,
     recursive: bool,
     max_files: usize,
+    mut count: &mut usize,
 ) -> Result<Vec<ApiFileNode>, String> {
-    let mut count = 0;
     let mut roots = Vec::new();
     for rel in ["purpose.md", "schema.md", "wiki", "raw/sources"] {
         let path = safe_join(project_path, rel)?;
@@ -287,15 +287,19 @@ pub(super) fn push_file_node(
         return Ok(());
     }
     *count += 1;
-    if *count > max_files {
-        return Err(format!("File listing exceeds maxFiles limit ({max_files})"));
-    }
+    // Over-limit entries are skipped (not an error): the caller reports
+    // truncated=true from the counter, so clients can page instead of
+    // getting a 413 with no data (F-12).
+    let over_limit = *count > max_files;
     let is_dir = file_type.is_dir();
-    let children = if recursive && is_dir {
+    let children = if recursive && is_dir && !over_limit {
         Some(list_tree(project_path, path, true, max_files, count)?)
     } else {
         None
     };
+    if over_limit {
+        return Ok(());
+    }
     out.push(ApiFileNode {
         name,
         path: relative_to_project(project_path, path),

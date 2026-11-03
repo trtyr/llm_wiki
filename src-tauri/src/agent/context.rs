@@ -280,6 +280,9 @@ pub async fn load_explicit_context_files(
     };
     let mut out = Vec::new();
     let mut remaining = MAX_EXPLICIT_CONTEXT_CHARS;
+    // Every rejected @-mention used to vanish silently: the model answered
+    // without the file and the request still looked healthy (F-55). Each
+    // skip now carries its reason into the server log.
     for requested_path in requested.iter().take(MAX_EXPLICIT_CONTEXT_FILES) {
         let normalized = requested_path.trim().replace('\\', "/");
         let relative = Path::new(&normalized);
@@ -290,13 +293,16 @@ pub async fn load_explicit_context_files(
                 .any(|part| !matches!(part, Component::Normal(_)))
             || normalized.split('/').any(|part| part.starts_with('.'))
         {
+            eprintln!("[context] skipped context file '{normalized}': not a relative in-project path");
             continue;
         }
         let candidate = root.join(relative);
         let Ok(candidate_canon) = candidate.canonicalize() else {
+            eprintln!("[context] skipped context file '{normalized}': does not resolve");
             continue;
         };
         if !candidate_canon.starts_with(&root_canon) || !candidate_canon.is_file() {
+            eprintln!("[context] skipped context file '{normalized}': outside project or not a file");
             continue;
         }
         // Reuse the application's canonical reader so @ attachments support
@@ -308,10 +314,14 @@ pub async fn load_explicit_context_files(
         )
         .await
         else {
+            eprintln!("[context] skipped context file '{normalized}': read failed");
             continue;
         };
         let fitted = trim_chars(content.trim(), remaining.min(MAX_EXPLICIT_FILE_CHARS));
         if fitted.is_empty() {
+            eprintln!(
+                "[context] skipped context file '{normalized}': nothing fits in the remaining budget"
+            );
             continue;
         }
         remaining = remaining.saturating_sub(fitted.chars().count());

@@ -20,7 +20,25 @@ pub fn is_allowed_browser_origin(origin: &str) -> bool {
         || origin == "https://tauri.localhost"
 }
 
-pub fn local_cors_headers(origin: Option<&str>, allow_headers: &str) -> Vec<Header> {
+// Chrome's Private Network Access sends this request header on
+// preflights from public pages; the response header is only meaningful
+// as an answer to it, so it is emitted on demand instead of
+// unconditionally inviting PNA (F-30).
+pub fn requests_private_network(request: &tiny_http::Request) -> bool {
+    request.headers().iter().any(|header| {
+        header.field.equiv("Access-Control-Private-Network-Request")
+            && header
+                .value
+                .as_str()
+                .eq_ignore_ascii_case("true")
+    })
+}
+
+pub fn local_cors_headers(
+    origin: Option<&str>,
+    allow_headers: &str,
+    pna_request: bool,
+) -> Vec<Header> {
     // NOTE: no Content-Type here. tiny_http OVERWRITES duplicate headers,
     // so a shared Content-Type here would clobber each response's own
     // type (text/event-stream for SSE, text/html for /docs, application/json
@@ -37,7 +55,10 @@ pub fn local_cors_headers(origin: Option<&str>, allow_headers: &str) -> Vec<Head
     if let Some(origin) = origin.filter(|origin| is_allowed_browser_origin(origin)) {
         headers.push(Header::from_bytes("Access-Control-Allow-Origin", origin).unwrap());
         headers.push(Header::from_bytes("Vary", "Origin").unwrap());
-        headers.push(Header::from_bytes("Access-Control-Allow-Private-Network", "true").unwrap());
+        if pna_request {
+            headers
+                .push(Header::from_bytes("Access-Control-Allow-Private-Network", "true").unwrap());
+        }
     }
     headers
 }
@@ -82,19 +103,19 @@ mod tests {
 
     #[test]
     fn cors_headers_reflect_allowed_origin_only() {
-        let allowed = local_cors_headers(Some("http://localhost:3000"), "Content-Type");
+        let allowed = local_cors_headers(Some("http://localhost:3000"), "Content-Type", false);
         assert_eq!(
             header_value(&allowed, "Access-Control-Allow-Origin").as_deref(),
             Some("http://localhost:3000")
         );
         assert_eq!(header_value(&allowed, "Vary").as_deref(), Some("Origin"));
 
-        let denied = local_cors_headers(Some("https://evil.com"), "Content-Type");
+        let denied = local_cors_headers(Some("https://evil.com"), "Content-Type", false);
         assert!(header_value(&denied, "Access-Control-Allow-Origin").is_none());
         assert!(header_value(&denied, "Access-Control-Allow-Private-Network").is_none());
         assert!(header_value(&denied, "Vary").is_none());
 
-        let missing = local_cors_headers(None, "Content-Type");
+        let missing = local_cors_headers(None, "Content-Type", false);
         assert!(header_value(&missing, "Access-Control-Allow-Origin").is_none());
     }
 }

@@ -3,7 +3,7 @@ use std::fs;
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -89,6 +89,8 @@ static API_STATUS: AtomicU8 = AtomicU8::new(0);
 static IN_FLIGHT_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static IN_FLIGHT_CHAT_STREAMS: AtomicUsize = AtomicUsize::new(0);
 static IN_FLIGHT_PAGE_EMBEDS: AtomicUsize = AtomicUsize::new(0);
+static SSE_DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+static SSE_DROPPED_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
 static APP_STATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedAppState>>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -217,7 +219,9 @@ pub fn start_api_server(app: ServerHost) {
             let method = request.method().clone();
             let url = request.url().to_string();
             let origin = request_origin(&request);
-            if should_rate_limit(&method, &url) && !allow_request() {
+            if should_rate_limit(&method, &url)
+                && !allow_request(request.remote_addr().map(|addr| addr.ip()))
+            {
                 respond_error(request, 429, "Too many requests", origin.as_deref());
                 continue;
             }
@@ -394,7 +398,7 @@ fn handle_delete_file(app: &ServerHost, project_id: &str, query: &str) -> ApiRes
     }
     let history_recorded = commands::file_history::record_file_version(&path, "api", "api.files.delete");
     if let Err(e) = fs::remove_file(&path) {
-        return err(500, format!("Failed to delete file: {e}"));
+        return err_internal("file delete", e);
     }
 
     let mut vectors_cleared = false;
@@ -463,14 +467,17 @@ fn handle_files(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse 
         _ => return err(400, "root must be wiki, sources, or all"),
     };
     if rel.is_empty() {
-        return match list_public_roots(&project.path, recursive, max_files) {
+        let mut count = 0;
+        return match list_public_roots(&project.path, recursive, max_files, &mut count)
+        {
             Ok(files) => ok(json!({
                 "ok": true,
                 "projectId": project.id,
                 "root": "all",
                 "files": files,
+                "truncated": count > max_files,
             })),
-            Err(e) => err(if e.contains("exceeds") { 413 } else { 500 }, e),
+            Err(e) => err_internal("files list", e),
         };
     }
     let dir = match safe_join(&project.path, rel) {
@@ -484,9 +491,9 @@ fn handle_files(app: &ServerHost, project_id: &str, query: &str) -> ApiResponse 
             "projectId": project.id,
             "root": rel,
             "files": files,
-            "truncated": false,
+            "truncated": count > max_files,
         })),
-        Err(e) => err(if e.contains("exceeds") { 413 } else { 500 }, e),
+        Err(e) => err_internal("files list", e),
     }
 }
 
@@ -535,7 +542,7 @@ fn handle_file_content(app: &ServerHost, project_id: &str, query: &str) -> ApiRe
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             err(415, "File is not valid UTF-8 text")
         }
-        Err(e) => err(500, format!("Failed to read file: {}", e)),
+        Err(e) => err_internal("file read", e),
     }
 }
 
@@ -841,19 +848,44 @@ fn external_chat_response(mut response: agent::types::AgentChatResponse) -> Valu
 /// The agent runtime reports errors as free-form strings, so this is
 /// necessarily a heuristic — co-located here with the known producer
 /// messages from the runtime.
+// Heuristic classifier over agent error strings. Producers and their
+// intended codes:
+// - 499  client cancel ("Agent turn cancelled")
+// - 400  caller-fixable request problems: tool argument validators
+//        ("requires query/path/an active skill", "unknown agent tool",
+//        "unsupported") and model-produced invalid tool plans
+//        ("invalid request", "invalid tool")
+// - 503  THIS service is not ready: LLM not configured (runtime errors
+//        starting "Backend Agent LLM is not configured") - retrying
+//        without reconfiguring is pointless, so never 502 (F-28)
+// - 502  upstream provider failures (HTTP errors, non-JSON bodies);
+//        provider-local config damage ("Invalid API key header") is a
+//        deployment problem, not the caller's, so 503 rather than the
+//        old blanket 400 (F-42)
+// - 500  anything unrecognized
 fn chat_error_status(error: &str) -> u16 {
     if error == "Agent turn cancelled" {
         return 499;
     }
     let lower = error.to_ascii_lowercase();
+    if lower.starts_with("backend agent llm is not configured")
+        || lower.contains("invalid api key header")
+        || lower.contains("invalid authorization header")
+    {
+        return 503;
+    }
     if lower.contains("requires query")
         || lower.contains("requires path")
         || lower.contains("requires an active skill")
-        || lower.contains("invalid")
         || lower.contains("unsupported")
         || lower.starts_with("unknown agent tool")
+        || lower.starts_with("invalid request")
+        || lower.starts_with("invalid tool")
     {
         return 400;
+    }
+    if lower.contains("invalid llm json") || lower.contains("llm http ") {
+        return 502;
     }
     502
 }
@@ -903,7 +935,9 @@ fn respond_chat_sse(
         }
     };
     let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(SSE_QUEUE_CAPACITY);
-    let _ = try_send_sse(
+    // The meta frame carries sessionId/runId; a dropped meta frame means
+    // the client cannot address cancel at all, so it is never silent (F-43).
+    match try_send_sse(
         &sender,
         sse_frame(
             "meta",
@@ -913,7 +947,17 @@ fn respond_chat_sse(
                 "runId": prepared.run_id,
             }),
         ),
-    );
+    ) {
+        SseSendResult::Sent => {}
+        SseSendResult::Full => eprintln!(
+            "[api] SSE meta frame dropped (queue full) for run {}",
+            prepared.run_id
+        ),
+        SseSendResult::Disconnected => eprintln!(
+            "[api] SSE meta frame lost (client gone) for run {}",
+            prepared.run_id
+        ),
+    }
 
     let (heartbeat_stop, heartbeat_done) = mpsc::channel::<()>();
     let heartbeat_sender = sender.clone();
@@ -934,7 +978,10 @@ fn respond_chat_sse(
                         );
                         break;
                     }
-                    SseSendResult::Sent | SseSendResult::Full => {}
+                    SseSendResult::Sent => {}
+                    SseSendResult::Full => {
+                        SSE_DROPPED_HEARTBEATS.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -955,10 +1002,18 @@ fn respond_chat_sse(
                 SseSendResult::Disconnected => {
                     registry.cancel(&cancel_project, &cancel_session, Some(&cancel_run));
                 }
+                SseSendResult::Sent => {}
                 // Intermediate events may be dropped for a temporarily slow
                 // client. The terminal `done` frame still carries the complete
-                // aggregate response, so correctness is preserved.
-                SseSendResult::Sent | SseSendResult::Full => {}
+                // aggregate response, so correctness is preserved - but the
+                // gap is now counted and logged instead of invisible (F-43).
+                SseSendResult::Full => {
+                    let dropped =
+                        SSE_DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprintln!(
+                        "[api] SSE queue full; dropped agent event #{dropped} (run {cancel_run})"
+                    );
+                }
             }
         });
         let result =
@@ -1020,7 +1075,7 @@ fn respond_chat_sse(
         None,
         None,
     );
-    for header in cors_headers(origin) {
+    for header in cors_headers(origin, crate::cors::requests_private_network(&request)) {
         response.add_header(header);
     }
     let _ = request.respond(response);
@@ -1653,13 +1708,16 @@ fn handle_list_file_history(app: &ServerHost, project_id: &str, query: &str) -> 
     let Some(rel) = params.get("path") else {
         return err(400, "Missing path query parameter");
     };
+    // Same guard order as files/content and DELETE files/content: the
+    // public-surface check answers first so non-public paths get the
+    // fixed 403 instead of safe_join's resolver error text (F-22).
+    if !is_public_project_rel(rel) {
+        return err(403, "Path is not exposed by the local API");
+    }
     let abs_path = match safe_join(&project.path, rel) {
         Ok(abs_path) => abs_path.to_string_lossy().into_owned(),
         Err(e) => return err(400, e),
     };
-    if !is_public_project_rel(rel) {
-        return err(403, "Path is not exposed by the local API");
-    }
     match app.block_on(commands::file_history::list_file_history(
         project.path.clone(),
         abs_path,

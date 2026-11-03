@@ -77,7 +77,10 @@ pub(super) fn process_request(app: ServerHost, mut request: tiny_http::Request) 
         response.add_header(
             tiny_http::Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap(),
         );
-        for header in cors_headers(origin.as_deref()) {
+        for header in cors_headers(
+            origin.as_deref(),
+            crate::cors::requests_private_network(&request),
+        ) {
             response.add_header(header);
         }
         let _ = request.respond(response);
@@ -150,24 +153,39 @@ fn handle_request(
         // "Enabled / disabled / port_conflict" line, and curl-from-
         // terminal users need a way to confirm the server is alive
         // before they go hunting for why other endpoints 503.
-        return ok(json!({
+        // Unauthenticated callers get the liveness fields only (F-16):
+        // tokenSource/allowLanAccess/authConfigured are reconnaissance
+        // gold and belong behind the token.
+        let base = json!({
             "ok": true,
             "status": get_api_status(),
             "version": env!("CARGO_PKG_VERSION"),
-            "authRequired": api_auth_required(app),
-            "authConfigured": api_token(app).is_some(),
-            "tokenSource": api_token_source(app),
-            "enabled": api_enabled(app),
-            "mcpEnabled": api_mcp_enabled(app),
-            "allowUnauthenticated": api_allow_unauthenticated(app),
-            "allowLanAccess": api_allow_lan_access(app),
             "docs": "/docs?token=<your token>",
-            "agent": {
+        });
+        if !is_authorized(app, query, &headers) {
+            return ok(base);
+        }
+        let mut full = base;
+        let obj = full.as_object_mut().unwrap();
+        obj.insert("authRequired".into(), json!(api_auth_required(app)));
+        obj.insert("authConfigured".into(), json!(api_token(app).is_some()));
+        obj.insert("tokenSource".into(), json!(api_token_source(app)));
+        obj.insert("enabled".into(), json!(api_enabled(app)));
+        obj.insert("mcpEnabled".into(), json!(api_mcp_enabled(app)));
+        obj.insert(
+            "allowUnauthenticated".into(),
+            json!(api_allow_unauthenticated(app)),
+        );
+        obj.insert("allowLanAccess".into(), json!(api_allow_lan_access(app)));
+        obj.insert(
+            "agent".into(),
+            json!({
                 "chat": true,
                 "streaming": true,
                 "streamProtocol": "sse",
-            },
-        }));
+            }),
+        );
+        return ok(full);
     }
     if method == &Method::Get
         && (path == "/openapi.json" || path == "/" || path == format!("{API_PREFIX}/openapi.json"))
@@ -398,8 +416,12 @@ fn read_body(request: &mut tiny_http::Request, max_body_bytes: usize) -> Result<
 
 
 
-pub(super) fn cors_headers(origin: Option<&str>) -> Vec<Header> {
-    local_cors_headers(origin, "Content-Type, Authorization, X-LLM-Wiki-Token")
+pub(super) fn cors_headers(origin: Option<&str>, pna_request: bool) -> Vec<Header> {
+    local_cors_headers(
+        origin,
+        "Content-Type, Authorization, X-LLM-Wiki-Token",
+        pna_request,
+    )
 }
 
 
