@@ -1914,6 +1914,18 @@ fn parse_bocha_results(value: Value) -> Vec<WebSearchItem> {
         .collect()
 }
 
+/// Scrub the api_key query value out of an error string (F-21): reqwest
+/// error Display embeds the full request URL, credential included.
+fn redact_api_key(text: &str) -> String {
+    let mut out = text.to_string();
+    if let Some(start) = out.find("api_key=") {
+        let rest = &out[start + 8..];
+        let end = rest.find(['&', ' ']).unwrap_or(rest.len());
+        out.replace_range(start + 8..start + 8 + end, "***");
+    }
+    out
+}
+
 async fn serpapi_search(
     client: &reqwest::Client,
     query: &str,
@@ -1922,6 +1934,10 @@ async fn serpapi_search(
 ) -> Result<Vec<WebSearchItem>, String> {
     let key = required_api_key(config, "SerpApi")?;
     let engine = config.serp_api_engine.as_deref().unwrap_or("google");
+    // F-21: SerpApi's documented auth channel is the api_key query
+    // parameter (no header auth in their API reference), so the key stays
+    // in the URL - but it must never survive into error text, whose
+    // Display includes the full request URL.
     let url = format!(
         "https://serpapi.com/search?engine={}&q={}&api_key={}&num={}",
         url_encode(engine),
@@ -1930,11 +1946,16 @@ async fn serpapi_search(
         max_results
     );
     let response = client
-        .get(url)
+        .get(&url)
         .header("Accept", "application/json")
         .send()
         .await
-        .map_err(|err| format!("Network error reaching SerpApi: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "Network error reaching SerpApi: {}",
+                redact_api_key(&err.to_string())
+            )
+        })?;
     parse_web_json_response(response, "SerpApi", |value| {
         for key in [
             "organic_results",
@@ -2978,7 +2999,19 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
+    #[test]
+    fn redact_api_key_scrubs_query_credential() {
+        // F-21: the SerpApi key rides in the query string; error text must
+        // not carry it.
+        assert_eq!(
+            redact_api_key(
+                "error sending request for url (https://serpapi.com/search?engine=google&q=x&api_key=secret123&num=5)"
+            ),
+            "error sending request for url (https://serpapi.com/search?engine=google&q=x&api_key=***&num=5)"
+        );
+        assert_eq!(redact_api_key("no url here"), "no url here");
+    }
+
     async fn registry_executes_project_scoped_shell_command() {
         let root = std::env::temp_dir().join(format!("llm-wiki-shell-tool-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
