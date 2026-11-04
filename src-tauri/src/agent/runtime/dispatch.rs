@@ -331,7 +331,10 @@ impl AgentRuntime {
                     .map(str::trim)
                     .filter(|url| !url.is_empty())
                     .ok_or_else(|| "web.fetch requires url".to_string())?;
-                Ok(serde_json::json!({ "url": url }))
+                Ok(serde_json::json!({
+                    "url": url,
+                    "maxChars": action.max_chars,
+                }))
             }
             "skill.read_file" => {
                 let path = action

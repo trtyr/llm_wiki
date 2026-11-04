@@ -83,6 +83,8 @@ struct AgentLoopAction {
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
+    max_chars: Option<u64>,
+    #[serde(default)]
     skill: Option<String>,
     #[serde(default)]
     command: Option<String>,

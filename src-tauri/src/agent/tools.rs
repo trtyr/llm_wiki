@@ -252,7 +252,8 @@ impl ToolRegistry for BuiltinToolRegistry {
                         .get("url")
                         .and_then(Value::as_str)
                         .ok_or_else(|| "web.fetch requires url".to_string())?;
-                    serde_json::to_value(run_web_fetch(url).await?)
+                    let max_chars = input.get("maxChars").and_then(Value::as_u64);
+                    serde_json::to_value(run_web_fetch(url, max_chars.map(|v| v as usize)).await?)
                         .map_err(|err| format!("Failed to serialize web.fetch result: {err}"))
                 }
                 "anytxt.search" => {
@@ -504,7 +505,13 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             parameters: Some(serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string" }
+                    "url": { "type": "string" },
+                    "maxChars": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 500000,
+                        "description": "Cap on extracted page text characters (default 128000)"
+                    }
                 },
                 "required": ["url"]
             })),
@@ -2025,58 +2032,256 @@ fn web_fetch_ip_allowed(ip: std::net::IpAddr) -> bool {
 /// block tags to line breaks, strip remaining tags, decode entities.
 /// Good enough for the agent to read an article; not a full Markdown
 /// converter (issue #2).
-pub(crate) fn html_to_text(html: &str) -> String {
-    const BLOCK_TAGS: [&str; 12] = [
-        "p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section",
+/// Readability-style main-content location: if the page has an obvious
+/// content container (<article>, <main>, or a div/section whose id/class
+/// marks it as the content area - e.g. MediaWiki's `mw-parser-output`),
+/// prune and convert ONLY that region. Nav/header/footer and infobox
+/// chrome outside the container never enter the extraction at all, which
+/// is what makes big portals fit the text budget. Falls back to the
+/// whole page when no container is found (issue: site-test follow-up).
+fn find_main_content_region(html: &str, lower: &str) -> Option<(usize, usize)> {
+    let candidates = [
+        "<article",
+        "<main",
+        "mw-parser-output",
+        "id=\"content\"",
+        "class=\"content",
     ];
-    let mut out = String::with_capacity(html.len());
-    let bytes = html.as_bytes();
-    let mut i = 0;
-    let mut pending_break = false;
+    let mut best: Option<(usize, usize)> = None;
+    for needle in candidates {
+        let Some(pos) = lower.find(needle) else {
+            continue;
+        };
+        // Walk back to the '<' of this open tag.
+        let tag_start = lower[..pos].rfind('<').unwrap_or(pos);
+        // Find the end of the open tag, then count matching closes by
+        // tag name to locate the container's real end.
+        let Some(gt) = lower[tag_start..].find('>') else {
+            continue;
+        };
+        let tag_name: String = lower[tag_start + 1..tag_start + gt]
+            .trim_start()
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric())
+            .collect();
+        if tag_name.is_empty() {
+            continue;
+        }
+        let open = format!("<{}", tag_name);
+        let close = format!("</{}", tag_name);
+        let mut depth = 1usize;
+        let mut cursor = tag_start + gt + 1;
+        let mut region_end = cursor;
+        while cursor < lower.len() {
+            let next_open = lower[cursor..].find(&open).map(|p| cursor + p);
+            let next_close = lower[cursor..].find(&close).map(|p| cursor + p);
+            match (next_open, next_close) {
+                (Some(o), Some(c)) => {
+                    if o < c {
+                        depth += 1;
+                        cursor = o + open.len();
+                    } else {
+                        depth -= 1;
+                        cursor = c + close.len();
+                        if depth == 0 {
+                            region_end = lower[cursor..]
+                                .find('>')
+                                .map(|g| cursor + g + 1)
+                                .unwrap_or(cursor);
+                            break;
+                        }
+                    }
+                }
+                (Some(o), None) => {
+                    depth += 1;
+                    cursor = o + open.len();
+                }
+                (None, Some(c)) => {
+                    depth -= 1;
+                    cursor = c + close.len();
+                    if depth == 0 {
+                        region_end = lower[cursor..]
+                            .find('>')
+                            .map(|g| cursor + g + 1)
+                            .unwrap_or(cursor);
+                        break;
+                    }
+                }
+                (None, None) => {
+                    region_end = lower.len();
+                    break;
+                }
+            }
+        }
+        if region_end > tag_start {
+            best = Some((tag_start, region_end));
+            break; // first candidate wins; ordered by preference
+        }
+    }
+    best
+}
+
+pub(crate) fn html_to_text(html: &str) -> String {
+    // v2: block-level main-content pruning, the open-source standard
+    // (Readability.js / trafilatura / Crawl4AI): segment at block tags,
+    // drop structural-noise elements entirely, then reject small blocks
+    // that are almost pure links (menus, breadcrumbs, footers - the junk
+    // that made naive extraction unusable on real portals).
+    const NOISE_TAGS: [&str; 13] = [
+        "nav", "header", "footer", "aside", "form", "noscript", "svg", "button", "iframe",
+        "dialog", "menu", "select", "template",
+    ];
+    const BLOCK_TAGS: [&str; 20] = [
+        "p",
+        "div",
+        "br",
+        "li",
+        "tr",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "section",
+        "article",
+        "table",
+        "ul",
+        "ol",
+        "dl",
+        "dd",
+        "dt",
+        "blockquote",
+    ];
+
     let lower = html.to_lowercase();
+    // Narrow to the main-content region when one exists, so portal
+    // chrome (wikipedia sidebars, github shell, bbc modules) never
+    // consumes the extraction budget.
+    let scoped: String;
+    let html: &str = if let Some((start, end)) = find_main_content_region(html, &lower) {
+        scoped = html[start..end].to_string();
+        &scoped
+    } else {
+        html
+    };
+    let lower = html.to_lowercase();
+    let bytes = html.as_bytes();
+    let mut blocks: Vec<(usize, usize)> = Vec::new(); // (link_chars, total_chars) per block
+    let mut cur_link_chars = 0usize;
+    let mut cur_total_chars = 0usize;
+    let mut in_link = 0usize; // nesting depth of <a>
+    let mut skipping_tag: Option<String> = None; // inside noise element body
+    let mut pending_break = false;
+    let mut out = String::with_capacity(html.len() / 4);
+
+    let mut flush_block =
+        |blocks: &mut Vec<(usize, usize)>, out: &mut String, link: usize, total: usize| {
+            if total == 0 {
+                return;
+            }
+            let density = link as f32 / total as f32;
+            // Small all-link blocks are menus/breadcrumbs; keep bigger ones
+            // (list pages like HN legitimately consist of linked titles).
+            if density > 0.7 && total < 150 {
+                return;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            blocks.push((link, total));
+        };
+
+    let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'<' {
-            let Some(gt) = lower[i..].find('>') else {
+            let Some(gt_rel) = lower[i..].find('>') else {
                 break; // truncated tag: drop the tail
             };
-            let tag = lower[i + 1..i + gt].trim();
-            let tag = tag.strip_prefix('/').unwrap_or(tag);
-            let name: String = tag
+            let gt = i + gt_rel;
+            let raw_tag = lower[i + 1..gt].trim();
+            let closing = raw_tag.starts_with('/');
+            let tag_name: String = raw_tag
+                .trim_start_matches('/')
                 .chars()
                 .take_while(|ch| ch.is_ascii_alphanumeric())
                 .collect();
-            if name == "script" || name == "style" {
-                // skip the element body entirely
-                let close_lower = format!("</{}", &lower[i + 1..i + 1 + name.len()]);
-                if let Some(close) = lower[i..].find(&close_lower) {
-                    let after = i + close;
-                    match lower[after..].find('>') {
-                        Some(gt2) => {
-                            i = after + gt2 + 1;
-                            continue;
-                        }
-                        None => break,
-                    }
+
+            if let Some(noise) = &skipping_tag {
+                if closing && *noise == tag_name {
+                    skipping_tag = None;
                 }
+                i = gt + 1;
+                continue;
             }
-            if BLOCK_TAGS.contains(&name.as_str()) {
-                pending_break = true;
+            if NOISE_TAGS.contains(&tag_name.as_str()) && !closing {
+                // flush what came before the element
+                flush_block(&mut blocks, &mut out, cur_link_chars, cur_total_chars);
+                cur_link_chars = 0;
+                cur_total_chars = 0;
+                skipping_tag = Some(tag_name);
+                i = gt + 1;
+                continue;
             }
-            i += gt + 1;
+            if tag_name == "script" || tag_name == "style" {
+                skipping_tag = Some(tag_name);
+                i = gt + 1;
+                continue;
+            }
+            if tag_name == "a" {
+                if closing {
+                    in_link = in_link.saturating_sub(1);
+                } else {
+                    in_link += 1;
+                }
+                i = gt + 1;
+                continue;
+            }
+            if BLOCK_TAGS.contains(&tag_name.as_str()) {
+                flush_block(&mut blocks, &mut out, cur_link_chars, cur_total_chars);
+                cur_link_chars = 0;
+                cur_total_chars = 0;
+                i = gt + 1;
+                continue;
+            }
+            i = gt + 1;
+            continue;
+        }
+        if skipping_tag.is_some() {
+            i += 1;
             continue;
         }
         if pending_break {
-            if !out.ends_with("\n\n") {
-                out.push('\n');
-            }
             pending_break = false;
         }
-        // copy one UTF-8 char
+        // copy one UTF-8 char, counting link share
         let ch_len = utf8_seq_len(bytes[i]);
         let end = (i + ch_len).min(bytes.len());
-        out.push_str(&html[i..end]);
+        let seg = &html[i..end];
+        let seg_chars = seg.chars().count();
+        if seg_chars == 1
+            && seg
+                .chars()
+                .next()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(true)
+        {
+            // whitespace still counts toward total but not toward junk
+            cur_total_chars += 1;
+            if in_link > 0 {
+                cur_link_chars += 1;
+            }
+        } else {
+            cur_total_chars += seg_chars;
+            if in_link > 0 {
+                cur_link_chars += seg_chars;
+            }
+        }
+        out.push_str(seg);
         i = end;
     }
+    flush_block(&mut blocks, &mut out, cur_link_chars, cur_total_chars);
+
     // collapse whitespace runs for readability
     let mut collapsed = String::with_capacity(out.len());
     let mut last_space = false;
@@ -2093,7 +2298,6 @@ pub(crate) fn html_to_text(html: &str) -> String {
     }
     crate::commands::fs::decode_xml_entities(collapsed.trim())
 }
-
 fn utf8_seq_len(first_byte: u8) -> usize {
     match first_byte {
         0..=127 => 1,
@@ -2104,7 +2308,13 @@ fn utf8_seq_len(first_byte: u8) -> usize {
     }
 }
 
-const WEB_FETCH_MAX_BYTES: usize = 512 * 1024;
+// Market-standard truncation (issue: site-test follow-up): cap the
+// OUTPUT text, not the raw HTML. Raw pages are 10-20x their readable
+// text, so a raw-byte cap burns the budget on markup. Fetch up to
+// 2 MiB of HTML, prune to main content, then cap the extracted text.
+const WEB_FETCH_MAX_BYTES: usize = 2 * 1024 * 1024;
+const WEB_FETCH_DEFAULT_TEXT_CHARS: usize = 128_000;
+const WEB_FETCH_MAX_TEXT_CHARS: usize = 500_000;
 const WEB_FETCH_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2121,7 +2331,10 @@ pub struct WebFetchOutput {
 /// Open a URL and return readable page text (issue #2). Public addresses
 /// only, 512 KiB cap, 20 s timeout; redirects re-validated against the
 /// final host.
-pub async fn run_web_fetch(url: &str) -> Result<WebFetchOutput, String> {
+pub async fn run_web_fetch(
+    url: &str,
+    max_text_chars: Option<usize>,
+) -> Result<WebFetchOutput, String> {
     let parsed = web_fetch_url_allowed(url)?;
     let client = crate::proxy::configure_http_client(
         reqwest::Client::builder()
@@ -2196,13 +2409,25 @@ pub async fn run_web_fetch(url: &str) -> Result<WebFetchOutput, String> {
     } else {
         raw
     };
-    let text = text.chars().take(200_000).collect::<String>();
+    // Truncation applies to the extracted text (industry practice:
+    // Anthropic max_content_tokens / Jina token budget / Firecrawl
+    // main-content markdown).
+    let max_chars = max_text_chars
+        .unwrap_or(WEB_FETCH_DEFAULT_TEXT_CHARS)
+        .clamp(1_000, WEB_FETCH_MAX_TEXT_CHARS);
+    let text_chars = text.chars().count();
+    let text_truncated = text_chars > max_chars;
+    let text = if text_truncated {
+        text.chars().take(max_chars).collect::<String>()
+    } else {
+        text
+    };
     Ok(WebFetchOutput {
         url: url.trim().to_string(),
         final_url,
         content_type,
         bytes: body.len(),
-        truncated,
+        truncated: truncated || text_truncated,
         text,
     })
 }
@@ -4084,10 +4309,27 @@ mod tests {
         assert!(text.contains("Title"));
         assert!(text.contains("First & para"));
         assert!(text.contains("Second"));
-        assert!(text.contains("link text"));
+        // (the standalone <a> block is all-link menu junk: pruned by v2)
         assert!(!text.contains("alert"));
         assert!(!text.contains("color:red"));
         assert!(!text.contains('<'));
+    }
+
+    #[test]
+    fn html_to_text_prunes_menu_blocks_and_keeps_articles() {
+        let html = "<html><body>\
+            <nav><a href='/'>Home</a><a href='/about'>About</a><a href='/x'>X</a></nav>\
+            <article><p>This is the actual article paragraph with plenty of real \
+            content that carries the meaning of the page and should definitely stay.</p>\
+            <p>Second paragraph of the article body.</p></article>\
+            <footer><a href='/p'>Privacy</a><a href='/t'>Terms</a><a href='/c'>Contact</a></footer>\
+            </body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("actual article paragraph"));
+        assert!(text.contains("Second paragraph"));
+        assert!(!text.contains("Privacy"));
+        assert!(!text.contains("Terms"));
+        assert!(!text.contains("Home</a>"));
     }
 
     #[test]
