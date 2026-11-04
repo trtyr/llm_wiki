@@ -433,10 +433,27 @@ impl AgentRuntime {
                     .get("finalUrl")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown url");
-                Ok(format!(
-                    "fetched {bytes} bytes from {final_url}{}",
-                    if truncated { " (truncated)" } else { "" }
-                ))
+                // The extracted page text MUST be part of the observation -
+                // a byte count alone leaves the agent unable to actually
+                // read what it fetched (the whole point of the tool).
+                let text = value.get("text").and_then(Value::as_str).unwrap_or("");
+                let mut summary = format!(
+                    "fetched {bytes} bytes from {final_url}{}; page text:
+{}",
+                    if truncated {
+                        " (TRUNCATED at the 512 KiB cap - content may end mid-sentence)"
+                    } else {
+                        ""
+                    },
+                    trim_chars(text, 12_000)
+                );
+                if truncated {
+                    summary.push_str(
+                        "
+[the page was larger than the fetch cap; the text above is partial]",
+                    );
+                }
+                Ok(summary)
             }
             "source.search" | "graph.search" | "web.search" | "anytxt.search" => {
                 let found: Vec<AgentReference> = serde_json::from_value(value)

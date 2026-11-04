@@ -880,6 +880,34 @@ pub(crate) fn decode_xml_entities(text: &str) -> String {
             "gt" => Some('>'.to_string()),
             "quot" => Some('"'.to_string()),
             "apos" => Some('\''.to_string()),
+            // Common named entities real-world pages emit constantly
+            // (they showed up as raw "&nbsp;" junk in extracted text
+            // during the web.fetch site tests); the full HTML5 entity
+            // table is not needed for readable extraction.
+            "nbsp" => Some('\u{a0}'.to_string()),
+            "mdash" => Some('\u{2014}'.to_string()),
+            "ndash" => Some('\u{2013}'.to_string()),
+            "hellip" => Some('\u{2026}'.to_string()),
+            "middot" => Some('\u{b7}'.to_string()),
+            "copy" => Some('\u{a9}'.to_string()),
+            "reg" => Some('\u{ae}'.to_string()),
+            "trade" => Some('\u{2122}'.to_string()),
+            "ldquo" => Some('\u{201c}'.to_string()),
+            "rdquo" => Some('\u{201d}'.to_string()),
+            "lsquo" => Some('\u{2018}'.to_string()),
+            "rsquo" => Some('\u{2019}'.to_string()),
+            "laquo" => Some('\u{ab}'.to_string()),
+            "raquo" => Some('\u{bb}'.to_string()),
+            "times" => Some('\u{d7}'.to_string()),
+            "plusmn" => Some('\u{b1}'.to_string()),
+            "deg" => Some('\u{b0}'.to_string()),
+            "euro" => Some('\u{20ac}'.to_string()),
+            "pound" => Some('\u{a3}'.to_string()),
+            "yen" => Some('\u{a5}'.to_string()),
+            "cent" => Some('\u{a2}'.to_string()),
+            "sect" => Some('\u{a7}'.to_string()),
+            "para" => Some('\u{b6}'.to_string()),
+            "bull" => Some('\u{2022}'.to_string()),
             "amp" => None, // resolved last: treat as literal for now
             _ => if let Some(hex) = entity
                 .strip_prefix("#x")
@@ -2635,7 +2663,10 @@ mod tests {
         assert_eq!(decode_xml_entities("&#x2014;"), "\u{2014}");
         assert_eq!(decode_xml_entities("&#160;"), "\u{a0}");
         // unknown entity stays verbatim
-        assert_eq!(decode_xml_entities("&nbsp;"), "&nbsp;");
+        // named entities beyond the XML core (web.fetch site tests found
+        // &nbsp;/&middot;/&hellip; leaking raw into extracted text)
+        assert_eq!(decode_xml_entities("a&nbsp;b&middot;c&hellip;d"), "a b·c…d");
+        assert_eq!(decode_xml_entities("&unknownent;"), "&unknownent;");
         assert_eq!(decode_xml_entities("plain"), "plain");
     }
 
