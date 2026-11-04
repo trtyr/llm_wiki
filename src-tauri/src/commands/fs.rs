@@ -263,7 +263,7 @@ fn org_to_markdown(content: &str) -> String {
         }
 
         if upper.starts_with("#+BEGIN_SRC") {
-            let language = trimmed[11..].trim().split_whitespace().next().unwrap_or("");
+            let language = trimmed[11..].split_whitespace().next().unwrap_or("");
             output.push(format!("```{language}"));
             block_end = Some("#+END_SRC");
             continue;
@@ -850,7 +850,7 @@ fn read_zip_file(archive: &mut zip::ZipArchive<fs::File>, name: &str) -> Option<
     Some(content)
 }
 
-fn decode_xml_entities(text: &str) -> String {
+pub(crate) fn decode_xml_entities(text: &str) -> String {
     // Single pass, &amp; resolved LAST (F-39): the old replace chain ran
     // &amp; first, so literal "&lt;" encoded as "&amp;lt;" collapsed into
     // "<". Numeric entities beyond LF/CR now decode too (Word/PPT emit
@@ -1082,7 +1082,7 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
                         result.push_str(&table_row.join(" | "));
                         result.push_str(" |\n");
                         if is_first_table_row {
-                            result.push_str("|");
+                            result.push('|');
                             for _ in &table_row {
                                 result.push_str(" --- |");
                             }

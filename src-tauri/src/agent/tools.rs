@@ -247,6 +247,14 @@ impl ToolRegistry for BuiltinToolRegistry {
                     )
                     .map_err(|err| format!("Failed to serialize web.search result: {err}"))
                 }
+                "web.fetch" => {
+                    let url = input
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "web.fetch requires url".to_string())?;
+                    serde_json::to_value(run_web_fetch(url).await?)
+                        .map_err(|err| format!("Failed to serialize web.fetch result: {err}"))
+                }
                 "anytxt.search" => {
                     let query = tool_query(&input, "anytxt.search")?;
                     serde_json::to_value(
@@ -484,6 +492,21 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                     "topK": { "type": "integer", "minimum": 1, "maximum": 10 }
                 },
                 "required": ["query"]
+            })),
+        },
+        ToolSpec {
+            name: "web.fetch".to_string(),
+            description: "Open a public http(s) URL and return its page text
+                (HTML converted to readable text). Use after web.search to read
+                a specific result, or when the user hands you a link. Internal,
+                loopback and private-network addresses are refused.".to_string(),
+            effects: vec![ToolEffect::Network, ToolEffect::Read],
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" }
+                },
+                "required": ["url"]
             })),
         },
         ToolSpec {
@@ -1926,6 +1949,264 @@ fn redact_api_key(text: &str) -> String {
     out
 }
 
+/// SSRF guard: web.fetch is agent-driven, so a model-produced URL must
+/// not become a probe of the server's own network (loopback API, cloud
+/// metadata at 169.254.x, tailnet peers). Scheme and every resolved
+/// address are checked; redirects are re-checked against the final URL
+/// (issue #2).
+pub(crate) fn web_fetch_url_allowed(url: &str) -> Result<reqwest::Url, String> {
+    let parsed =
+        reqwest::Url::parse(url.trim()).map_err(|err| format!("web.fetch: invalid URL: {err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "web.fetch: unsupported scheme '{other}' (only http/https)"
+            ))
+        }
+    }
+    let host = parsed
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "web.fetch: URL has no host".to_string())?;
+    let host = host.to_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".internal") {
+        return Err("web.fetch: refusing internal host".to_string());
+    }
+    let default_port = if parsed.scheme() == "https" { 443 } else { 80 };
+    let port = parsed.port_or_known_default().unwrap_or(default_port);
+    // Resolve and check every address the name maps to.
+    let mut resolved = false;
+    use std::net::ToSocketAddrs;
+    for addr in (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|err| format!("web.fetch: failed to resolve host: {err}"))?
+    {
+        resolved = true;
+        if !web_fetch_ip_allowed(addr.ip()) {
+            return Err(format!(
+                "web.fetch: refusing non-public address for '{host}'"
+            ));
+        }
+    }
+    if !resolved {
+        return Err(format!("web.fetch: host '{host}' did not resolve"));
+    }
+    Ok(parsed)
+}
+
+fn web_fetch_ip_allowed(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr::{V4, V6};
+    match ip {
+        V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_documentation())
+        }
+        V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                // IPv4-mapped (::ffff:10.0.0.1 etc): check the embedded v4
+                || matches!(v6.to_ipv4_mapped(), Some(v4) if !web_fetch_ip_allowed(V4(v4)))
+                // unique-local (fc00::/7) is the v6 "private" range
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // link-local fe80::/10
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Minimal HTML -> readable text: drop script/style/comments, convert
+/// block tags to line breaks, strip remaining tags, decode entities.
+/// Good enough for the agent to read an article; not a full Markdown
+/// converter (issue #2).
+pub(crate) fn html_to_text(html: &str) -> String {
+    const BLOCK_TAGS: [&str; 12] = [
+        "p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section",
+    ];
+    let mut out = String::with_capacity(html.len());
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    let mut pending_break = false;
+    let lower = html.to_lowercase();
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let Some(gt) = lower[i..].find('>') else {
+                break; // truncated tag: drop the tail
+            };
+            let tag = lower[i + 1..i + gt].trim();
+            let tag = tag.strip_prefix('/').unwrap_or(tag);
+            let name: String = tag
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric())
+                .collect();
+            if name == "script" || name == "style" {
+                // skip the element body entirely
+                let close_lower = format!("</{}", &lower[i + 1..i + 1 + name.len()]);
+                if let Some(close) = lower[i..].find(&close_lower) {
+                    let after = i + close;
+                    match lower[after..].find('>') {
+                        Some(gt2) => {
+                            i = after + gt2 + 1;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            if BLOCK_TAGS.contains(&name.as_str()) {
+                pending_break = true;
+            }
+            i += gt + 1;
+            continue;
+        }
+        if pending_break {
+            if !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            pending_break = false;
+        }
+        // copy one UTF-8 char
+        let ch_len = utf8_seq_len(bytes[i]);
+        let end = (i + ch_len).min(bytes.len());
+        out.push_str(&html[i..end]);
+        i = end;
+    }
+    // collapse whitespace runs for readability
+    let mut collapsed = String::with_capacity(out.len());
+    let mut last_space = false;
+    for ch in out.chars() {
+        if ch.is_whitespace() {
+            if !last_space {
+                collapsed.push(if ch == '\n' { '\n' } else { ' ' });
+            }
+            last_space = true;
+        } else {
+            collapsed.push(ch);
+            last_space = false;
+        }
+    }
+    crate::commands::fs::decode_xml_entities(collapsed.trim())
+}
+
+fn utf8_seq_len(first_byte: u8) -> usize {
+    match first_byte {
+        0..=127 => 1,
+        192..=223 => 2,
+        224..=239 => 3,
+        240..=247 => 4,
+        _ => 1,
+    }
+}
+
+const WEB_FETCH_MAX_BYTES: usize = 512 * 1024;
+const WEB_FETCH_TIMEOUT_SECS: u64 = 20;
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebFetchOutput {
+    pub url: String,
+    pub final_url: String,
+    pub content_type: String,
+    pub bytes: usize,
+    pub truncated: bool,
+    pub text: String,
+}
+
+/// Open a URL and return readable page text (issue #2). Public addresses
+/// only, 512 KiB cap, 20 s timeout; redirects re-validated against the
+/// final host.
+pub async fn run_web_fetch(url: &str) -> Result<WebFetchOutput, String> {
+    let parsed = web_fetch_url_allowed(url)?;
+    let client = crate::proxy::configure_http_client(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::limited(5)),
+    )
+    .build()
+    .map_err(|err| format!("web.fetch: failed to build HTTP client: {err}"))?;
+    let response = client
+        .get(parsed)
+        .header(
+            "Accept",
+            "text/html, text/plain, application/xhtml+xml, */*;q=0.8",
+        )
+        .header(
+            "User-Agent",
+            "llm-wiki-agent/0.6 (+https://github.com/trtyr/llm_wiki)",
+        )
+        .send()
+        .await
+        .map_err(|err| format!("web.fetch: request failed: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("web.fetch: HTTP {status}"));
+    }
+    // Redirects may have landed on an internal address; re-validate.
+    let final_url = response.url().to_string();
+    web_fetch_url_allowed(&final_url)?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let looks_textual = mime.starts_with("text/")
+        || mime == "application/xhtml+xml"
+        || mime == "application/json"
+        || mime == "application/xml"
+        || mime.is_empty();
+    if !looks_textual {
+        return Err(format!(
+            "web.fetch: unsupported content type '{content_type}' (binary content)"
+        ));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut response = response;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| format!("web.fetch: read failed: {err}"))?
+    {
+        if body.len() + chunk.len() > WEB_FETCH_MAX_BYTES {
+            body.extend_from_slice(&chunk[..WEB_FETCH_MAX_BYTES - body.len()]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let raw = String::from_utf8_lossy(&body).into_owned();
+    let text = if mime.contains("html")
+        || mime == "application/xhtml+xml"
+        || raw.trim_start().starts_with('<')
+    {
+        html_to_text(&raw)
+    } else {
+        raw
+    };
+    let text = text.chars().take(200_000).collect::<String>();
+    Ok(WebFetchOutput {
+        url: url.trim().to_string(),
+        final_url,
+        content_type,
+        bytes: body.len(),
+        truncated,
+        text,
+    })
+}
+
 async fn serpapi_search(
     client: &reqwest::Client,
     query: &str,
@@ -2269,8 +2550,8 @@ fn build_knowledge_graph_snapshot(
                     tags: page
                         .tags
                         .iter()
-                        .cloned()
                         .take(MAX_KNOWLEDGE_CONTEXT_ITEMS)
+                        .cloned()
                         .collect(),
                     outgoing_links,
                     backlinks: page_backlinks,
@@ -3777,6 +4058,36 @@ mod tests {
     #[test]
     fn url_encode_handles_unicode_terms() {
         assert_eq!(url_encode("煤矿 safety"), "%E7%85%A4%E7%9F%BF+safety");
+    }
+
+    #[test]
+    fn web_fetch_refuses_internal_targets() {
+        // loopback, private ranges, link-local metadata, wrong scheme
+        assert!(web_fetch_url_allowed("http://127.0.0.1:19828/health").is_err());
+        assert!(web_fetch_url_allowed("http://localhost/x").is_err());
+        assert!(web_fetch_url_allowed("http://10.0.0.5/x").is_err());
+        assert!(web_fetch_url_allowed("http://169.254.169.254/latest/meta-data").is_err());
+        assert!(web_fetch_url_allowed("http://192.168.1.10/x").is_err());
+        assert!(web_fetch_url_allowed("http://[::1]/x").is_err());
+        assert!(web_fetch_url_allowed("file:///etc/passwd").is_err());
+        assert!(web_fetch_url_allowed("ftp://example.com/x").is_err());
+        // public host resolves (needs DNS; use a guaranteed-public name)
+        assert!(web_fetch_url_allowed("https://example.com/").is_ok());
+    }
+
+    #[test]
+    fn html_to_text_strips_tags_and_keeps_structure() {
+        let html = "<html><head><style>body{color:red}</style></head>\
+            <body><h1>Title</h1><p>First &amp; para</p><script>alert(1)</script>\
+            <p>Second</p><a href='x'>link text</a></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Title"));
+        assert!(text.contains("First & para"));
+        assert!(text.contains("Second"));
+        assert!(text.contains("link text"));
+        assert!(!text.contains("alert"));
+        assert!(!text.contains("color:red"));
+        assert!(!text.contains('<'));
     }
 
     #[test]

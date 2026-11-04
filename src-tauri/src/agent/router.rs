@@ -135,6 +135,7 @@ mod tests {
                 wiki: true,
                 web: true,
                 anytxt: false,
+                fetch: false,
             },
         );
         assert_eq!(decision.intent, QueryIntent::NeedsExternalSearch);

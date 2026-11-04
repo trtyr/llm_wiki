@@ -223,13 +223,13 @@ async fn prepare_embedding_rows(
     // Build every vector before replacing the page in LanceDB. A provider
     // failure therefore leaves the previous, known-good page index intact.
     let mut rows = Vec::with_capacity(chunks.len());
-    if supports_embedding_batch(&config) {
+    if supports_embedding_batch(config) {
         for batch in chunks.chunks(EMBEDDING_BATCH_SIZE) {
             let texts = batch
                 .iter()
-                .map(|chunk| enrich_chunk(&title, chunk))
+                .map(|chunk| enrich_chunk(title, chunk))
                 .collect::<Vec<_>>();
-            let embeddings = fetch_embedding_batch(&texts, &config)
+            let embeddings = fetch_embedding_batch(&texts, config)
                 .await
                 .map_err(|err| PageEmbeddingError::new(PageEmbeddingErrorKind::Provider, err))?;
             if embeddings.len() != batch.len() {
@@ -244,8 +244,8 @@ async fn prepare_embedding_rows(
         }
     } else {
         for (index, chunk) in chunks.iter().enumerate() {
-            let embedding_text = enrich_chunk(&title, chunk);
-            let embedding = fetch_embedding_with_retry(&embedding_text, &config, 3)
+            let embedding_text = enrich_chunk(title, chunk);
+            let embedding = fetch_embedding_with_retry(&embedding_text, config, 3)
                 .await
                 .map_err(|err| PageEmbeddingError::new(PageEmbeddingErrorKind::Provider, err))?;
             rows.push(chunk_row(index, chunk, embedding));

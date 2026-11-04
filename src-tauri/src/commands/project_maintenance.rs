@@ -360,7 +360,7 @@ fn rebuild_wiki_index_inner(project_path: String) -> Result<RebuildIndexResult, 
         groups.entry(kind).or_default().push((target, title));
     }
     for pages in groups.values_mut() {
-        pages.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        pages.sort_by_key(|a| a.1.to_lowercase());
     }
     let count = groups.values().map(Vec::len).sum();
     let mut output = String::from("# Wiki Index\n\n");

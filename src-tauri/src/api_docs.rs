@@ -107,7 +107,7 @@ pub fn render(spec: &Value) -> String {
                             if required {
                                 out.push_str("<span class=\"req\">必填</span>");
                             } else {
-                                out.push_str("否");
+                                out.push('否');
                             }
                             out.push_str("</td><td>");
                             push_escaped(&mut out, desc);

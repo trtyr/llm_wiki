@@ -221,7 +221,7 @@ impl AgentRuntime {
         }
 
         let mut retrieval_parts = Vec::new();
-        let tool_registry = tools::BuiltinToolRegistry::default();
+        let tool_registry = tools::BuiltinToolRegistry;
         if self
             .llm_config
             .as_ref()
@@ -1879,7 +1879,11 @@ impl AgentRuntime {
             "workspace.append_file",
         ];
         const SKILLS_TOOLS: [&str; 2] = ["workspace.write_file", "shell.exec"];
-        let gated = [("web.search", tools.web), ("anytxt.search", tools.anytxt)];
+        let gated = [
+            ("web.search", tools.web),
+            ("anytxt.search", tools.anytxt),
+            ("web.fetch", tools.fetch),
+        ];
         let specs = tools::builtin_tool_specs();
         let mut available: Vec<&str> = specs
             .iter()
@@ -1904,7 +1908,7 @@ impl AgentRuntime {
         let skill_context = render_skill_planner_context(skills, skill_mode);
         let workspace = agent_workspace_display(&self.project_path);
         let user = format!(
-            "User request:\n{message}\n\nSkill context:\n{skill_context}\n\nAvailable tools: {}\n\nAgent workspace for generated files: {workspace}\n\nReturn JSON exactly like {{\"toolCalls\":[{{\"tool\":\"wiki.search\",\"query\":\"short query\"}}]}}. Use an empty array when no tool is needed. The skill context and tool list above are already available to the assistant; do not call wiki.search, source.search, graph.search, web.search, anytxt.search, skill.read_file, workspace.write_file, or shell.exec merely to list, explain, or summarize the currently available skills, tools, modes, or agent capabilities. Use wiki.search for factual or topical retrieval. Prefer graph.search for relationships, dependencies, neighborhoods, backlinks, or connections between entities; pass concise entity or concept names instead of the full question. The planner may select both when the answer needs page content and graph structure. Prefer web.search only for current/external information. Prefer anytxt.search only for user files outside the wiki. Use wiki.write_page only when the user explicitly asks to create a wiki page; include path under wiki/ ending in .md and full Markdown content. Existing pages are create-only by default; include allowOverwrite:true only when the user explicitly asks to overwrite or update an existing wiki page. Use skill.read_file for Markdown/reference files inside an active skill directory. Use workspace.write_file for generated artifacts under agent-workspace; do not inline large heredocs or generated file bodies inside shell.exec. Use shell.exec only when a relevant active skill requires a command-line operation after any large files have been written. shell.exec runs from the Agent workspace; commands that generate files must write them under that workspace and must not write to home, Desktop, Downloads, system temp folders, hidden app metadata folders, or skill installation folders.",
+            "User request:\n{message}\n\nSkill context:\n{skill_context}\n\nAvailable tools: {}\n\nAgent workspace for generated files: {workspace}\n\nReturn JSON exactly like {{\"toolCalls\":[{{\"tool\":\"wiki.search\",\"query\":\"short query\"}}]}}. Use an empty array when no tool is needed. The skill context and tool list above are already available to the assistant; do not call wiki.search, source.search, graph.search, web.search, anytxt.search, skill.read_file, workspace.write_file, or shell.exec merely to list, explain, or summarize the currently available skills, tools, modes, or agent capabilities. Use wiki.search for factual or topical retrieval. Prefer graph.search for relationships, dependencies, neighborhoods, backlinks, or connections between entities; pass concise entity or concept names instead of the full question. The planner may select both when the answer needs page content and graph structure. Prefer web.search only for current/external information. After a web.search hit, or when the user hands you a specific link, use web.fetch with its URL to read the actual page text before drawing conclusions. Prefer anytxt.search only for user files outside the wiki. Use wiki.write_page only when the user explicitly asks to create a wiki page; include path under wiki/ ending in .md and full Markdown content. Existing pages are create-only by default; include allowOverwrite:true only when the user explicitly asks to overwrite or update an existing wiki page. Use skill.read_file for Markdown/reference files inside an active skill directory. Use workspace.write_file for generated artifacts under agent-workspace; do not inline large heredocs or generated file bodies inside shell.exec. Use shell.exec only when a relevant active skill requires a command-line operation after any large files have been written. shell.exec runs from the Agent workspace; commands that generate files must write them under that workspace and must not write to home, Desktop, Downloads, system temp folders, hidden app metadata folders, or skill installation folders.",
             available.join(", "),
         );
         let client = LlmClient::new(config.clone())?
@@ -2954,7 +2958,12 @@ fn require_tool_permission(
     if request.retrieval_mode == AgentRetrievalMode::Faithful
         && matches!(
             tool,
-            "wiki.search" | "wiki.read_page" | "graph.search" | "web.search" | "anytxt.search"
+            "wiki.search"
+                | "wiki.read_page"
+                | "graph.search"
+                | "web.search"
+                | "anytxt.search"
+                | "web.fetch"
         )
     {
         return Err(format!(
@@ -2992,6 +3001,12 @@ fn require_tool_permission(
         "web.search" => {
             if !request.tools.web {
                 return Err("web.search is disabled for this turn".to_string());
+            }
+            permission_policy.require(AgentCapability::Network)
+        }
+        "web.fetch" => {
+            if !request.tools.fetch {
+                return Err("web.fetch is disabled for this turn".to_string());
             }
             permission_policy.require(AgentCapability::Network)
         }
@@ -3274,6 +3289,7 @@ mod tests {
                     wiki: true,
                     web: false,
                     anytxt: false,
+                    fetch: false,
                 },
                 top_k: Some(3),
                 include_content: Some(false),
@@ -3316,6 +3332,7 @@ mod tests {
                     wiki: true,
                     web: false,
                     anytxt: false,
+                    fetch: false,
                 },
                 ..Default::default()
             })
@@ -3432,6 +3449,7 @@ mod tests {
                     wiki: false,
                     web: false,
                     anytxt: false,
+                    fetch: false,
                 },
                 top_k: None,
                 include_content: None,
@@ -3476,6 +3494,7 @@ mod tests {
                     wiki: true,
                     web: true,
                     anytxt: false,
+                    fetch: false,
                 },
                 top_k: Some(3),
                 include_content: Some(false),
@@ -3517,6 +3536,7 @@ mod tests {
                     wiki: true,
                     web: true,
                     anytxt: false,
+                    fetch: false,
                 },
                 top_k: Some(3),
                 include_content: Some(false),
@@ -3640,6 +3660,7 @@ mod tests {
                         wiki: false,
                         web: false,
                         anytxt: false,
+                        fetch: false,
                     },
                     top_k: None,
                     include_content: None,
@@ -3793,6 +3814,7 @@ mod tests {
             wiki: true,
             web: false,
             anytxt: false,
+            fetch: false,
         };
         assert!(should_plan_tools_with_model(
             "你现在有哪些 skill 可以使用？",
@@ -3831,6 +3853,7 @@ mod tests {
                 wiki: false,
                 web: false,
                 anytxt: false,
+                fetch: false,
             },
             false,
         ));
@@ -4344,6 +4367,7 @@ mod tests {
                 wiki: true,
                 web: false,
                 anytxt: false,
+                fetch: false,
             },
             ..AgentChatRequest::default()
         };
@@ -4366,6 +4390,7 @@ mod tests {
                 wiki: true,
                 web: true,
                 anytxt: true,
+                fetch: false,
             },
             ..AgentChatRequest::default()
         };
@@ -4853,6 +4878,7 @@ mod tests {
             wiki: true,
             web: false,
             anytxt: false,
+            fetch: false,
         };
         assert!(should_fallback_wiki_search(true, &tools, true));
         assert!(!should_fallback_wiki_search(false, &tools, true));
@@ -4863,6 +4889,7 @@ mod tests {
                 wiki: false,
                 web: false,
                 anytxt: false,
+                fetch: false,
             },
             true,
         ));

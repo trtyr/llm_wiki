@@ -1873,7 +1873,7 @@ fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> Api
                         .filter(|(_, v)| {
                             v.get("path")
                                 .and_then(Value::as_str)
-                                .map(|p| normalize_path(p))
+                                .map(normalize_path)
                                 .as_deref()
                                 == Some(path_norm.as_str())
                         })
@@ -1887,7 +1887,7 @@ fn handle_delete_project(app: &ServerHost, project_id: &str, query: &str) -> Api
                     recents.retain(|v| {
                         v.get("path")
                             .and_then(Value::as_str)
-                            .map(|p| normalize_path(p))
+                            .map(normalize_path)
                             .as_deref()
                             != Some(path_norm.as_str())
                     });

@@ -778,7 +778,25 @@
                   },
                   "tools": {
                     "type": "object",
-                    "description": "Tool toggles (web, anytxt, skills is inert)"
+                    "description": "Tool toggles (web = web.search, fetch = web.fetch URL reader [issue #2], anytxt; skills is inert).",
+                    "properties": {
+                      "wiki": {
+                        "type": "boolean",
+                        "default": true
+                      },
+                      "web": {
+                        "type": "boolean",
+                        "default": false
+                      },
+                      "anytxt": {
+                        "type": "boolean",
+                        "default": false
+                      },
+                      "fetch": {
+                        "type": "boolean",
+                        "default": false
+                      }
+                    }
                   },
                   "topK": {
                     "type": "integer"

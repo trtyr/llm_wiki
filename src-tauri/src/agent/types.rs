@@ -2,23 +2,21 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AgentMode {
     Fast,
+    #[default]
     Standard,
     Deep,
     LocalFirst,
 }
 
-impl Default for AgentMode {
-    fn default() -> Self {
-        Self::Standard
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AgentRetrievalMode {
     // Preserve the established single-pass/planner-driven retrieval behavior.
+    #[default]
     Standard,
     // Let the Agent iteratively close evidence gaps under a strict retrieval
     // budget and no-progress guard.
@@ -26,12 +24,6 @@ pub enum AgentRetrievalMode {
     // Use only raw source excerpts as answer evidence. This is explicit user
     // intent, never inferred from wording or language-specific heuristics.
     Faithful,
-}
-
-impl Default for AgentRetrievalMode {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +35,9 @@ pub struct AgentToolOptions {
     pub web: bool,
     #[serde(default)]
     pub anytxt: bool,
+    /// Issue #2: allow web.fetch (open a URL and read its text).
+    #[serde(default)]
+    pub fetch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,19 +55,15 @@ const fn default_true() -> bool {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AgentSkillMode {
     // Enabled skills are available as a candidate set. The model may choose
     // which one, if any, fits the request.
     Auto,
     // The user explicitly selected these skills for the turn. The runtime
     // should narrow skill context to this set and tell the model to apply it.
+    #[default]
     Explicit,
-}
-
-impl Default for AgentSkillMode {
-    fn default() -> Self {
-        Self::Explicit
-    }
 }
 
 impl Default for AgentToolOptions {
@@ -81,6 +72,7 @@ impl Default for AgentToolOptions {
             wiki: true,
             web: false,
             anytxt: false,
+            fetch: false,
         }
     }
 }

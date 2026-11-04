@@ -72,9 +72,8 @@ pub fn run_headless_server() -> i32 {
 
     api_server::start_api_server(host);
     eprintln!(
-        "[llm-server] API: http://{}{} (health: /health)",
-        server_bind::bind_addr(&bind_host, api_port),
-        "/api/v1"
+        "[llm-server] API: http://{}/api/v1 (health: /health)",
+        server_bind::bind_addr(&bind_host, api_port)
     );
 
     runtime.block_on(async {

@@ -229,14 +229,7 @@ pub(super) fn list_public_roots(
         if !path.exists() {
             continue;
         }
-        push_file_node(
-            project_path,
-            &path,
-            recursive,
-            max_files,
-            &mut count,
-            &mut roots,
-        )?;
+        push_file_node(project_path, &path, recursive, max_files, count, &mut roots)?;
     }
     Ok(roots)
 }

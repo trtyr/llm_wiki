@@ -163,7 +163,7 @@ fn handle_request(
             "version": env!("CARGO_PKG_VERSION"),
             "docs": "/docs?token=<your token>",
         });
-        if !is_authorized(app, query, &headers) {
+        if !is_authorized(app, query, headers) {
             return ok(base);
         }
         let mut full = base;
@@ -204,7 +204,7 @@ fn handle_request(
         // retry instantly the way 401 would.
         return err(503, "API server is disabled in Settings → API Server");
     }
-    if is_token_required_request(&method, &path) && !is_token_authorized(app, query, headers) {
+    if is_token_required_request(method, &path) && !is_token_authorized(app, query, headers) {
         return err(401, "Unauthorized");
     }
     if !is_authorized(app, query, headers) {

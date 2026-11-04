@@ -494,7 +494,7 @@ async fn vector_upsert_chunks_inner(
     chunks: Vec<ChunkUpsertInput>,
     revision: Option<&str>,
 ) -> Result<(), String> {
-    validate_page_id_for_v2(&page_id)?;
+    validate_page_id_for_v2(page_id)?;
     let lock = vectorstore_v2_lock(project_path);
     let _guard = lock.write().await;
 
@@ -513,7 +513,7 @@ async fn vector_upsert_chunks_inner(
         .map_err(|e| format!("DB connect error: {e}"))?;
 
     let schema = make_schema_v2(dim);
-    let batch = make_batch_v2(schema.clone(), &page_id, &chunks, dim)?;
+    let batch = make_batch_v2(schema.clone(), page_id, &chunks, dim)?;
     let tables = db
         .table_names()
         .execute()
