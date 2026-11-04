@@ -82,6 +82,11 @@ fn build_system_context(
     if router.should_hint_web {
         out.push_str("- web.search is available when current or external information is useful.\n");
     }
+    if router.should_hint_web_fetch {
+        out.push_str(
+            "- web.fetch is available: open a specific http(s) URL and read its page text. Use it when the user hands you a link, or to read a web.search hit before citing it.\n",
+        );
+    }
     if router.should_hint_anytxt {
         out.push_str(
             "- anytxt.search is available for local or remote file content indexed by AnyTXT.\n",

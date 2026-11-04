@@ -24,6 +24,7 @@ pub struct RouterDecision {
     // available.
     pub should_search_wiki: bool,
     pub should_hint_web: bool,
+    pub should_hint_web_fetch: bool,
     pub should_hint_anytxt: bool,
     pub should_include_sources: bool,
     pub rationale: String,
@@ -93,6 +94,7 @@ pub fn route_query(message: &str, mode: AgentMode, tools: &AgentToolOptions) -> 
         intent,
         should_search_wiki,
         should_hint_web: tools.web,
+        should_hint_web_fetch: tools.fetch,
         should_hint_anytxt: tools.anytxt,
         should_include_sources: explicit_raw || matches!(mode, AgentMode::Deep),
         rationale: match intent {

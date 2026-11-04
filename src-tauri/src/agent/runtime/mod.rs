@@ -81,6 +81,8 @@ struct AgentLoopAction {
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
     skill: Option<String>,
     #[serde(default)]
     command: Option<String>,

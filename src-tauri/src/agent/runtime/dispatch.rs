@@ -320,6 +320,19 @@ impl AgentRuntime {
                     .ok_or_else(|| "wiki.read_page requires path".to_string())?;
                 Ok(serde_json::json!({ "path": path }))
             }
+            "web.fetch" => {
+                // The model carries the URL in `query` (like a search term)
+                // or `path` (like a page location); accept both.
+                let url = action
+                    .url
+                    .as_deref()
+                    .or(action.query.as_deref())
+                    .or(action.path.as_deref())
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                    .ok_or_else(|| "web.fetch requires url".to_string())?;
+                Ok(serde_json::json!({ "url": url }))
+            }
             "skill.read_file" => {
                 let path = action
                     .path
@@ -408,6 +421,21 @@ impl AgentRuntime {
                 Ok(format!(
                     "{count} result(s), {added} new, mode={}, tokenHits={}, vectorHits={}, graphHits={}",
                     search.mode, search.token_hits, search.vector_hits, search.graph_hits
+                ))
+            }
+            "web.fetch" => {
+                let bytes = value.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                let truncated = value
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let final_url = value
+                    .get("finalUrl")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown url");
+                Ok(format!(
+                    "fetched {bytes} bytes from {final_url}{}",
+                    if truncated { " (truncated)" } else { "" }
                 ))
             }
             "source.search" | "graph.search" | "web.search" | "anytxt.search" => {
